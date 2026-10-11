@@ -25,12 +25,6 @@ def require(condition, message):
         raise Denied(message)
 
 
-def number(value, name, positive=False):
-    require(type(value) in (int, float) and math.isfinite(value), f"Invalid {name}")
-    require(value > 0 if positive else value >= 0, f"Invalid {name}")
-    return value
-
-
 def git(repo, *args):
     p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
     require(p.returncode == 0, p.stderr.decode(errors="replace").strip() or "Git failed")
@@ -94,21 +88,11 @@ def locked(path):
         yield path
 
 
-def available(s):
-    held = sum(x["seconds"] for x in s["reservations"].values() if x["state"] == "held")
-    return s["limits"]["execution_seconds"] - s["used_seconds"] - held
-
-
-def admit(s, task=None):
-    require(time.time() < s["deadline"], "Session checkpoint deadline reached")
-    cap = s["limits"]["attention_minutes"]
-    require(cap is None or s["attention_minutes"] < cap, "Human attention budget reached")
-    if task:
-        require(not task.get("superseded_by") and not task.get("contract_conflicts"),
-                "Contract is conflicted or superseded; start a linked follow-up task")
-        require(task["work_state"] == "ACTIVE", "Task is paused; inspect checkpoint before resuming")
-        require(task["failed_hypotheses"] < 2, "Two failed repair hypotheses; diagnosis checkpoint required")
-        require(time.time() < task["deadline"], "Task checkpoint deadline reached")
+def admit(task):
+    require(not task.get("superseded_by") and not task.get("contract_conflicts"),
+            "Contract is conflicted or superseded; start a linked follow-up task")
+    require(task["work_state"] == "ACTIVE", "Task is paused; inspect checkpoint before resuming")
+    require(task["failed_hypotheses"] < 2, "Two failed repair hypotheses; diagnosis checkpoint required")
 
 
 def contract(c):
@@ -122,7 +106,9 @@ def contract(c):
         require(name.replace("-", "").replace("_", "").isalnum(), "Unsafe check name")
         require(isinstance(check.get("argv"), list) and check["argv"] and
                 all(isinstance(a, str) for a in check["argv"]), "Check needs argv, no shell string")
-        number(check.get("timeout_seconds"), "check timeout", True)
+        timeout = check.get("timeout_seconds")
+        require(type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0,
+                "Check timeout must be a positive finite number")
         require(type(check.get("expected_exit", 0)) is int, "Expected exit must be integer")
     require(isinstance(c["required_external"], list), "External requirements must be a list")
     if c["mode"] == "pr":
@@ -131,7 +117,7 @@ def contract(c):
     return c
 
 
-def gate(s, t):
+def gate(t):
     now = snapshot(t["repo"])
     latest = {e["check"]: e for e in t["evidence"] if e["fingerprint"] == now["fingerprint"]}
     missing = [name for name in t["contract"]["checks"] if name not in latest]
@@ -165,53 +151,54 @@ def gate(s, t):
             "failed": failed, "blocked": blocked, "inconclusive": inconclusive, "reasons": reasons,
             "follows": t.get("follows"), "superseded_by": t.get("superseded_by"),
             "contract_conflicts": t.get("contract_conflicts", []),
-            "external_receipts": t["external"], "remaining_execution_seconds": round(available(s), 3),
+            "external_receipts": t["external"],
             "assurance": "Local checks are executed. Scope and external verification are lead-recorded claims; external sources are not fetched by this CLI."}
 
 
 def execute(s, t, name, state_path):
-    admit(s, t)
+    admit(t)
     require(name in t["contract"]["checks"], "Command is outside frozen contract")
     c = t["contract"]["checks"][name]
     timeout = c["timeout_seconds"]
-    require(timeout <= available(s), "Insufficient shared execution budget for the complete check")
-    require(timeout <= min(s["deadline"], t["deadline"]) - time.time(), "Check exceeds remaining checkpoint time")
     before = snapshot(t["repo"])
     rid = f"check-{len(s['events'])}"
-    s["reservations"][rid] = {"seconds": timeout, "role": "validation", "state": "held"}
-    s["events"].append({"event": "check-start", "id": rid, "check": name})
-    # Persist before launching: a killed lead leaves a held reservation and cannot double-spend.
-    save(state_path, s)
     logs = state_path.parent / (state_path.stem + "-logs")
     logs.mkdir(exist_ok=True)
     log = logs / (rid + ".log")
-    start = time.monotonic()
+    e = {"check": name, "status": "BLOCKED", "exit_code": None, "argv": c["argv"],
+         "expected_exit": c.get("expected_exit", 0), "fingerprint": before["fingerprint"],
+         "head": before["head"], "log": str(log),
+         "detail": "Check started without a recorded completion; verify owned process before rerunning",
+         "environment": {"python": sys.version.split()[0], "platform": sys.platform}, "time": time.time()}
+    t["evidence"].append(e)
+    s["events"].append({"event": "check-start", "id": rid, "check": name})
+    # Persist uncertainty before launch so a killed lead cannot expose an older PASS.
+    save(state_path, s)
     rc, status, detail = None, "BLOCKED", ""
     try:
         with log.open("wb") as out:
             p = subprocess.Popen(c["argv"], cwd=t["repo"], stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True)
             try:
+                e["process_group"] = p.pid
+                save(state_path, s)
                 rc = p.wait(timeout=timeout)
                 status = "PASS" if rc == c.get("expected_exit", 0) else "FAIL"
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
                 os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
                 detail = "Timed out or interrupted; owned process group terminated"
+            except OSError:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                raise
     except OSError as exc:
         detail = str(exc)
     finally:
-        used = time.monotonic() - start
-        s["used_seconds"] += used
-        s["reservations"][rid].update(state="settled", actual_seconds=used)
         after = snapshot(t["repo"])
         if before["fingerprint"] != after["fingerprint"]:
             status, detail = "INCONCLUSIVE", "Check changed source; rerun after inspecting changes"
-        e = {"check": name, "status": status, "exit_code": rc, "argv": c["argv"],
-             "expected_exit": c.get("expected_exit", 0), "fingerprint": before["fingerprint"],
-             "head": before["head"], "seconds": used, "log": str(log), "detail": detail,
-             "environment": {"python": sys.version.split()[0], "platform": sys.platform}, "time": time.time()}
-        t["evidence"].append(e)
+        e.update(status=status, exit_code=rc, detail=detail)
         s["events"].append({"event": "check-finish", "id": rid, "status": status})
         save(state_path, s)
     return e
@@ -233,10 +220,10 @@ def checkpoint(s, t, output, note):
         git(repo, "bundle", "create", str(stage / "history.bundle"), "--all")
         (stage / "state.json").write_text(json.dumps(s, indent=2))
         (stage / "resume.md").write_text(
-            f"# Resume {t['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(s,t)['validation']}.\n"
+            f"# Resume {t['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(t)['validation']}.\n"
             f"Head: {current['head']}\nFingerprint: {current['fingerprint']}\n"
             f"Failed hypotheses: {t['failed_hypotheses']}.\nNext: {note}\n\n"
-            "Read state.json for the frozen contract, original request, evidence, reservations and limits.\n"
+            "Read state.json for the frozen contract, original request, evidence and session history.\n"
             "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
             "then record its receipt using `durable`. Do not push merely to save state.\n"
             "Recovery: clone history.bundle into a NEW directory, checkout the recorded head, "
@@ -273,17 +260,12 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--state", required=True, type=Path, help="One lead-owned session ledger OUTSIDE target repositories")
     sp = p.add_subparsers(dest="command", required=True)
-    init = sp.add_parser("init")
-    init.add_argument("--minutes", type=float, default=60)
-    init.add_argument("--execution-seconds", type=float, default=1800)
-    init.add_argument("--attention-minutes", type=float)
-    init.add_argument("--helpers", type=int, default=0)
+    sp.add_parser("init")
     start = sp.add_parser("start")
     start.add_argument("--repo", required=True, type=Path)
     start.add_argument("--contract", required=True, type=Path)
     start.add_argument("--task", required=True)
     start.add_argument("--follows", help="Preceding task replaced by this authorized material follow-up")
-    start.add_argument("--minutes", type=float, default=30)
     for name in ("status", "gate", "run", "assess", "hypothesis", "park", "checkpoint", "durable", "resume", "receipt"):
         x = sp.add_parser(name)
         x.add_argument("--task", required=True)
@@ -304,20 +286,6 @@ def parser():
             x.add_argument("--head", required=True)
             x.add_argument("--result", choices=("PASS", "FAIL", "BLOCKED", "INCONCLUSIVE"), required=True)
             x.add_argument("--verified-by", help="Named verification source actually consulted by the lead; do not infer from a claim")
-    reserve = sp.add_parser("reserve")
-    reserve.add_argument("--id", required=True)
-    reserve.add_argument("--role", required=True)
-    reserve.add_argument("--seconds", type=float, required=True)
-    settle = sp.add_parser("settle")
-    settle.add_argument("--id", required=True)
-    settle.add_argument("--seconds", type=float, required=True)
-    attention = sp.add_parser("attention")
-    attention.add_argument("--minutes", type=float, required=True)
-    extend = sp.add_parser("extend")
-    extend.add_argument("--task", required=True)
-    extend.add_argument("--minutes", type=float, required=True)
-    extend.add_argument("--execution-seconds", type=float, default=0)
-    extend.add_argument("--owner-request", required=True)
     diagnose = sp.add_parser("diagnose")
     diagnose.add_argument("--task", required=True)
     diagnose.add_argument("--new-evidence", required=True)
@@ -329,20 +297,14 @@ def main(argv=None):
     try:
         with locked(a.state) as path:
             if a.command == "init":
-                require(not path.exists(), "Session already exists; budgets do not reset")
-                number(a.minutes, "minutes", True)
-                number(a.execution_seconds, "execution seconds", True)
-                if a.attention_minutes is not None: number(a.attention_minutes, "attention", True)
-                number(a.helpers, "helpers")
-                s = {"version": 1, "deadline": time.time() + a.minutes * 60,
-                     "limits": {"execution_seconds": a.execution_seconds, "attention_minutes": a.attention_minutes,
-                                "helpers": a.helpers}, "used_seconds": 0, "attention_minutes": 0,
-                     "reservations": {}, "tasks": {}, "events": []}
-                result = {"session": str(path), "limits": s["limits"]}
+                require(not path.exists(), "Session already exists; preserve its history")
+                s = {"version": 2, "tasks": {}, "events": []}
+                result = {"session": str(path), "version": s["version"]}
             else:
                 s = json.loads(path.read_text())
+                require(s.get("version") == 2,
+                        "Unsupported ledger version; preserve the original and review conversion before continuing")
                 if a.command == "start":
-                    admit(s)
                     require(a.task not in s["tasks"], "Task already exists")
                     repo = a.repo.resolve()
                     require(not path.is_relative_to(repo), "Session ledger must be outside repository")
@@ -360,49 +322,15 @@ def main(argv=None):
                                 "Follow-up cannot downgrade PR obligations")
                         require(set(preceding["contract"]["required_external"]) <= set(c["required_external"]),
                                 "Follow-up must retain required external obligations")
-                    number(a.minutes, "task minutes", True)
                     snap = snapshot(repo)
                     s["tasks"][a.task] = {"repo": str(repo), "contract": c, "base": snap,
-                        "deadline": min(s["deadline"], time.time() + a.minutes * 60), "work_state": "ACTIVE",
+                        "work_state": "ACTIVE",
                         "scope_outcome": "unknown", "scope_fingerprint": None, "evidence": [], "external": [],
                         "hypotheses": [], "failed_hypotheses": 0, "parked": []}
                     if preceding is not None:
                         s["tasks"][a.task]["follows"] = a.follows
-                        s["tasks"][a.task]["deadline"] = min(s["tasks"][a.task]["deadline"], preceding["deadline"])
                         preceding["superseded_by"] = a.task
                     result = {"task": a.task, "head": snap["head"], "goal": c["goal"]}
-                elif a.command == "reserve":
-                    admit(s)
-                    number(a.seconds, "reservation", True)
-                    require(a.role != "validation", "Validation reservations are internal only")
-                    require(a.id not in s["reservations"], "Reservation ID cannot be reused")
-                    helpers = [x for x in s["reservations"].values() if x["role"] != "validation"]
-                    require(len(helpers) < s["limits"]["helpers"], "Total helper ceiling reached")
-                    require(a.seconds <= available(s), "Shared budget already allocated")
-                    s["reservations"][a.id] = {"role": a.role, "seconds": a.seconds, "state": "held"}
-                    result = s["reservations"][a.id]
-                elif a.command == "settle":
-                    number(a.seconds, "actual seconds")
-                    r = s["reservations"][a.id]
-                    require(r["state"] == "held", "Reservation already settled")
-                    # Overruns are recorded honestly; never discard actual usage to preserve a green budget.
-                    r.update(state="settled", actual_seconds=a.seconds)
-                    s["used_seconds"] += a.seconds
-                    result = r
-                elif a.command == "attention":
-                    s["attention_minutes"] += number(a.minutes, "attention minutes")
-                    result = {"estimated_human_minutes": s["attention_minutes"]}
-                elif a.command == "extend":
-                    number(a.minutes, "extension", True)
-                    number(a.execution_seconds, "extension seconds")
-                    require(a.owner_request.strip(), "Explicit owner authorization reference required")
-                    t = s["tasks"][a.task]
-                    s["deadline"] = max(s["deadline"], time.time()) + a.minutes * 60
-                    t["deadline"] = min(s["deadline"], max(t["deadline"], time.time()) + a.minutes * 60)
-                    s["limits"]["execution_seconds"] += a.execution_seconds
-                    result = {"owner_request": a.owner_request, "extra_minutes": a.minutes,
-                              "extra_execution_seconds": a.execution_seconds}
-                    s["events"].append({"event": "owner-extension", **result})
                 elif a.command == "diagnose":
                     t = s["tasks"][a.task]
                     require(t["work_state"] == "PAUSED", "Checkpoint before diagnosis")
@@ -414,7 +342,7 @@ def main(argv=None):
                 else:
                     t = s["tasks"][a.task]
                     if a.command in ("status", "gate"):
-                        result = gate(s, t)
+                        result = gate(t)
                     elif a.command == "run": result = execute(s, t, a.check, path)
                     elif a.command == "assess":
                         require(a.evidence.strip(), "Acceptance or conflict evidence required")
@@ -426,7 +354,7 @@ def main(argv=None):
                         else:
                             t.update(scope_outcome=a.outcome, scope_evidence=a.evidence,
                                      scope_fingerprint=snapshot(t["repo"])["fingerprint"])
-                        result = gate(s, t)
+                        result = gate(t)
                     elif a.command == "hypothesis":
                         require(a.description not in [h["description"] for h in t["hypotheses"]], "Hypothesis already recorded")
                         t["hypotheses"].append({"description": a.description, "result": a.result})
@@ -447,9 +375,7 @@ def main(argv=None):
                         require(a.expect == snap["fingerprint"] == t["checkpoint_snapshot"]["fingerprint"],
                                 "Checkpoint tree differs; reconcile before resume")
                         require(t["checkpoint"]["durability"] == "operator-confirmed", "Persistent checkpoint receipt required")
-                        admit(s)
-                        require(t["failed_hypotheses"] < 2, "Diagnosis/owner scope extension needed; counters preserved")
-                        require(time.time() < t["deadline"], "Task deadline reached; explicit extension needed")
+                        require(t["failed_hypotheses"] < 2, "Diagnosis with new causal evidence required; history preserved")
                         t["work_state"] = "ACTIVE"
                         result = {"work_state": "ACTIVE", "next": t["next"]}
                     elif a.command == "receipt":
@@ -462,7 +388,7 @@ def main(argv=None):
                         t["external"].append({"kind": a.kind, "reference": a.reference, "head": a.head,
                                               "fingerprint": snap["fingerprint"], "verified_by": a.verified_by,
                                               "result": a.result, "assurance": "Lead-recorded external verification; CLI does not fetch or authenticate source"})
-                        result = gate(s, t)
+                        result = gate(t)
             s["events"].append({"event": a.command, "time": time.time()})
             save(path, s)
             print(json.dumps(result, indent=2))
