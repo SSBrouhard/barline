@@ -1,0 +1,17 @@
+{
+  "goal": "Replace this with the user's concrete outcome in one sentence.",
+  "owner_request": "Reference the current user request; this field records authorization, it does not grant it.",
+  "mode": "local",
+  "non_goals": ["Unrelated improvements", "Publishing, merging or deploying without task authority"],
+  "must_happen": ["Replace with observable acceptance behavior"],
+  "must_never": ["Weaken existing repository checks or silently expand scope"],
+  "policy_sources": ["Read current AGENTS.md/CONTRIBUTING.md and record the relevant path and revision"],
+  "checks": {
+    "test": {
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+      "timeout_seconds": 60,
+      "expected_exit": 0
+    }
+  },
+  "required_external": []
+}

@@ -1,0 +1,21 @@
+# Lean Agentic Engineering session contract
+
+Use this harness for real requested work. One lead owns the conversation, scope, integration, ledger and report. Do not create benchmark tasks or require a pilot before delivery.
+
+Read current repository instructions and only the relevant policy/skill. Write a short contract from the user's existing request: one-sentence bar, exclusions, must happen/must never, source pointers, allowed checks and expected results. Do not ask the user to approve routine implementation details already authorized. Do not let a budget waive repository obligations.
+
+Use `local` for local work that does not invoke a PR/adversarial-review delivery process, unless repository policy requires that process anyway. Use `pr` when shipping a PR, running the canonical adversarial review workflow, or where required by the repo. Read the current PR Freeze Bar from its canonical distribution; this file does not modify it. Its repository CI, full baseline evidence for inherited failures, protected assertions and final adversarial pass remain binding. When scope needs a material change, obtain an owner decision.
+
+Keep one session ledger outside the repos. Use the same ledger for the evening's tasks; prioritize the user's outcomes. Deadlines are checkpoint thresholds; attention minutes are rough actual human minutes, entered once when useful. Token/provider spend stays unknown unless the host exposes it. No task survey, percentage target or diary is needed.
+
+Default to one agent. When delegation is authorized and useful, select the role that helps: investigation, implementation or review. Reserve its allowance with `reserve` BEFORE dispatch; only the lead writes the ledger. Supply goal, allowed files/actions, return evidence, reservation, stopping condition and no child delegation/merge/deploy authority. Settle actual usage when it returns. Reservations account for delegated work; the host must enforce a child's timeout. Never call a ledger a sandbox or claim it meters model tokens.
+
+Run approved local checks by name through the harness. A passing command establishes its defined check, not the meaning of every acceptance criterion. Assess the bar with behavioral evidence. Changes invalidate prior results. Missing/blocked/inconclusive checks cannot become PASS. Ordinary PR external receipts are pointers; after actually consulting authoritative CI/independent review evidence, record a PASS receipt with its exact source/revision and `--verified-by`. That declaration records your verification; the CLI cannot authenticate it. Never use it for another agent's unverified green claim. Report local and externally observed evidence clearly.
+
+Stop new work at a deadline, exhausted budget, blocked mandatory access, proposed weakened invariant, or two failed repair hypotheses. A repeated explanation is not a fresh hypothesis. Park unrelated findings without opening new issues or PRs automatically. Finish authorized cleanup of owned resources. Preserve ongoing check reservations after a crash; verify/clean up the owned process before settling them.
+
+On pause, create one checkpoint with the next one or two actions. Persist its archive and latest ledger through an authorized durable destination, confirm the returned identity/hash, then record `durable`. Local existence is not proof of persistence. No automatic push for preservation. Resume by comparing actual branch, head and tree fingerprint; preserve failures and usage. Extend only against an actual owner authorization reference. Diagnosis resets the consecutive failure stop only with new causal evidence; history stays in the record.
+
+Write no lesson by default. When a non-obvious verified diagnosis would prevent expensive repetition, search the repo's existing lesson index and update one short note there. Prefer a structural guard or meaningful regression when that captures the actual failure. Do not invent another global memory registry.
+
+Finish with outcome, validation, material limitation and any needed decision. Improve this harness when real work exposes friction, through a separately bounded change. Its executable lives in this package; this session guide is not an installed skill or a second canonical Freeze Bar.
