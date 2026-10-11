@@ -103,4 +103,6 @@ Run the meaningful boundary tests from this package:
 python3 -m unittest discover -s tests -v
 ```
 
+GitHub Actions runs the same full suite for pull requests and pushes to `main`, on macOS and Linux with Python 3.10 and 3.14. See `.github/workflows/ci.yml`. These checks exercise the CLI; fresh T3 conversations remain separate integration validation.
+
 Revise when real work shows a defect or unnecessary friction. No minimum task count, baseline campaign or 30% pass/fail target.
