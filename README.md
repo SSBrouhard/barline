@@ -28,6 +28,23 @@ Local checks execute, log their command/exit/result/environment, and bind eviden
 
 `assess` is the lead's recorded acceptance judgment, separate from command evidence. A PASS says every configured local check passed on this tree and the lead marked its bar met. It does not certify arbitrary semantics, independent review or a deployed system. Work state (ACTIVE/PAUSED), scope and validation (PASS/FAIL/BLOCKED/INCONCLUSIVE) stay separate.
 
+### Follow-ups and frozen contracts
+
+The lead compares each follow-up against the current contract. Clarifications that leave acceptance criteria, exclusions and authorized actions unchanged continue the same task without another contract or approval. Material changes require a new frozen task in the existing ledger. Put the actual follow-up authorization reference in the new contract's `owner_request`; an already-authorized user request needs no additional approval.
+
+If a contradiction is identified, declare it immediately, even if the replacement contract is not ready:
+
+```bash
+python3 /path/lean-harness/lean.py --state /path/work/session.json assess --task fix --outcome conflict --evidence 'Follow-up request requires input validation excluded by fix'
+python3 /path/lean-harness/lean.py --state /path/work/session.json start --task validate --follows fix --repo /path/repo --contract /path/work/validate.json --minutes 30
+```
+
+`conflict` is sticky: later assessments cannot remove it or mark that task met. `start --follows` atomically records both task links and supersedes the predecessor. Its contract, check evidence and receipts remain unchanged as history, but its gate cannot PASS again. Reconciliation consists of completing the successor against its accurate new acceptance bar, not rewriting or reopening the old contract. A material follow-up can use `--follows` directly when no interim conflict declaration is needed.
+
+The successor must reference an existing, not already superseded task in the same repository and supply a nonblank `owner_request` different from the predecessor's. It must retain PR mode and all required external obligations. It starts with empty check evidence and receipts, including on an identical tree. Session limits, usage, reservations, deadline and history remain intact; the successor deadline cannot exceed its predecessor's. An expired phase still needs an authorized `extend`, not a new allowance through `start`. `init` continues to reject an existing ledger.
+
+These checks enforce the declared lifecycle, not semantic classification. The CLI does not read arbitrary requests, detect contradictions hidden in acceptance prose, prove that a new contract captures the request, or authenticate authorization. An agent that omits the declaration/link can still misuse an old task. Independent review and repository protections remain necessary where that trust boundary is insufficient. Existing ledgers work without migration; absent conflict/link fields mean no declaration has been recorded, not that scope was independently verified.
+
 For PR delivery set `mode` to `pr`, retain the existing repo requirements and include `repo-ci` and `final-adversarial-review` in `required_external`. Add any required baseline/platform/security lanes. Ordinary `receipt` pointers leave the gate BLOCKED. After actually reading the authoritative CI result or independent review, the lead can add a matching receipt with `--verified-by 'named source actually consulted'`, its actual `--reference` URL/path, `--head` and `--result`. All required receipts must be PASS on the exact candidate, and repo CI requires a clean tree. Edits invalidate them. A later FAIL supersedes earlier success.
 
 External verification is recorded by the lead, not fetched or authenticated by this CLI. The flag is an evidence declaration, not an approval request or security proof. Do not add it to an unverified agent claim. The lead's final report must name the independently observed checks/revision, required review independence, and this automation limit.

@@ -104,6 +104,8 @@ def admit(s, task=None):
     cap = s["limits"]["attention_minutes"]
     require(cap is None or s["attention_minutes"] < cap, "Human attention budget reached")
     if task:
+        require(not task.get("superseded_by") and not task.get("contract_conflicts"),
+                "Contract is conflicted or superseded; start a linked follow-up task")
         require(task["work_state"] == "ACTIVE", "Task is paused; inspect checkpoint before resuming")
         require(task["failed_hypotheses"] < 2, "Two failed repair hypotheses; diagnosis checkpoint required")
         require(time.time() < task["deadline"], "Task checkpoint deadline reached")
@@ -148,14 +150,21 @@ def gate(s, t):
         elif kind == "repo-ci" and now["dirty"]:
             external.append(kind)
     reasons = []
+    contract_blocked = bool(t.get("contract_conflicts") or t.get("superseded_by"))
+    if t.get("contract_conflicts"):
+        reasons.append("Declared contract conflict; reconcile in a new task using start --follows")
+    if t.get("superseded_by"):
+        reasons.append("Contract superseded by task " + t["superseded_by"])
     if external:
         reasons.append("External requirements need independent verification: " + ", ".join(external))
     if t["scope_outcome"] != "met" or t["scope_fingerprint"] != now["fingerprint"]:
         reasons.append("Lead must assess the frozen acceptance bar on this exact tree")
-    status = "FAIL" if failed else "BLOCKED" if blocked or external else "INCONCLUSIVE" if missing or reasons or inconclusive else "PASS"
+    status = "FAIL" if failed else "BLOCKED" if blocked or external or contract_blocked else "INCONCLUSIVE" if missing or reasons or inconclusive else "PASS"
     return {"validation": status, "scope": t["scope_outcome"], "work_state": t["work_state"],
             "head": now["head"], "fingerprint": now["fingerprint"], "missing": missing,
             "failed": failed, "blocked": blocked, "inconclusive": inconclusive, "reasons": reasons,
+            "follows": t.get("follows"), "superseded_by": t.get("superseded_by"),
+            "contract_conflicts": t.get("contract_conflicts", []),
             "external_receipts": t["external"], "remaining_execution_seconds": round(available(s), 3),
             "assurance": "Local checks are executed. Scope and external verification are lead-recorded claims; external sources are not fetched by this CLI."}
 
@@ -273,13 +282,14 @@ def parser():
     start.add_argument("--repo", required=True, type=Path)
     start.add_argument("--contract", required=True, type=Path)
     start.add_argument("--task", required=True)
+    start.add_argument("--follows", help="Preceding task replaced by this authorized material follow-up")
     start.add_argument("--minutes", type=float, default=30)
     for name in ("status", "gate", "run", "assess", "hypothesis", "park", "checkpoint", "durable", "resume", "receipt"):
         x = sp.add_parser(name)
         x.add_argument("--task", required=True)
         if name == "run": x.add_argument("--check", required=True)
         if name == "assess":
-            x.add_argument("--outcome", choices=("met", "not-met", "unknown"), required=True)
+            x.add_argument("--outcome", choices=("met", "not-met", "unknown", "conflict"), required=True)
             x.add_argument("--evidence", required=True)
         if name == "hypothesis":
             x.add_argument("--description", required=True)
@@ -337,12 +347,29 @@ def main(argv=None):
                     repo = a.repo.resolve()
                     require(not path.is_relative_to(repo), "Session ledger must be outside repository")
                     c = contract(json.loads(a.contract.read_text()))
+                    preceding = None
+                    if a.follows is not None:
+                        require(a.follows in s["tasks"], "Preceding task does not exist")
+                        preceding = s["tasks"][a.follows]
+                        require(preceding["repo"] == str(repo), "Follow-up must use the preceding repository")
+                        require(not preceding.get("superseded_by"), "Follow the current task, not a superseded task")
+                        require(isinstance(c["owner_request"], str) and c["owner_request"].strip() and
+                                c["owner_request"] != preceding["contract"]["owner_request"],
+                                "Reference the actual follow-up authorization in owner_request")
+                        require(preceding["contract"]["mode"] != "pr" or c["mode"] == "pr",
+                                "Follow-up cannot downgrade PR obligations")
+                        require(set(preceding["contract"]["required_external"]) <= set(c["required_external"]),
+                                "Follow-up must retain required external obligations")
                     number(a.minutes, "task minutes", True)
                     snap = snapshot(repo)
                     s["tasks"][a.task] = {"repo": str(repo), "contract": c, "base": snap,
                         "deadline": min(s["deadline"], time.time() + a.minutes * 60), "work_state": "ACTIVE",
                         "scope_outcome": "unknown", "scope_fingerprint": None, "evidence": [], "external": [],
                         "hypotheses": [], "failed_hypotheses": 0, "parked": []}
+                    if preceding is not None:
+                        s["tasks"][a.task]["follows"] = a.follows
+                        s["tasks"][a.task]["deadline"] = min(s["tasks"][a.task]["deadline"], preceding["deadline"])
+                        preceding["superseded_by"] = a.task
                     result = {"task": a.task, "head": snap["head"], "goal": c["goal"]}
                 elif a.command == "reserve":
                     admit(s)
@@ -390,8 +417,15 @@ def main(argv=None):
                         result = gate(s, t)
                     elif a.command == "run": result = execute(s, t, a.check, path)
                     elif a.command == "assess":
-                        t.update(scope_outcome=a.outcome, scope_evidence=a.evidence,
-                                 scope_fingerprint=snapshot(t["repo"])["fingerprint"])
+                        require(a.evidence.strip(), "Acceptance or conflict evidence required")
+                        if a.outcome == "met":
+                            require(not t.get("contract_conflicts") and not t.get("superseded_by"),
+                                    "Contract is conflicted or superseded; start a linked follow-up task")
+                        if a.outcome == "conflict":
+                            t.setdefault("contract_conflicts", []).append({"evidence": a.evidence, "time": time.time()})
+                        else:
+                            t.update(scope_outcome=a.outcome, scope_evidence=a.evidence,
+                                     scope_fingerprint=snapshot(t["repo"])["fingerprint"])
                         result = gate(s, t)
                     elif a.command == "hypothesis":
                         require(a.description not in [h["description"] for h in t["hypotheses"]], "Hypothesis already recorded")

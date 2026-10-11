@@ -66,6 +66,119 @@ class HarnessTests(unittest.TestCase):
         self.assess()
         self.assertEqual(self.gate(code=0)["validation"], "PASS")
 
+    def test_claude_conflict_cannot_be_cleared_by_acceptance_notes(self):
+        c = self.setup_task()
+        c["non_goals"] = ["New input validation or features"]
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "duration", "--repo", self.repo, "--contract", self.contract)
+        self.call("run", "--task", "duration", "--check", "test")
+        self.call("assess", "--task", "duration", "--outcome", "met",
+                  "--evidence", "Follow-up input validation passes despite the frozen exclusion")
+        # Arbitrary prose is not classified. The enforceable boundary starts at declaration.
+        self.assertEqual(self.call("gate", "--task", "duration")["validation"], "PASS")
+        result = self.call("assess", "--task", "duration", "--outcome", "conflict",
+                           "--evidence", "Owner follow-up requires validation excluded by this contract")
+        self.assertEqual(result["validation"], "BLOCKED")
+        self.call("assess", "--task", "duration", "--outcome", "met",
+                  "--evidence", "Put the new requirements in acceptance notes", code=2)
+        self.call("assess", "--task", "duration", "--outcome", "unknown", "--evidence", "Reconsidering")
+        self.assertEqual(self.call("gate", "--task", "duration", code=1)["validation"], "BLOCKED")
+        self.call("run", "--task", "duration", "--check", "test", code=2)
+
+    def test_material_followup_preserves_session_and_needs_fresh_evidence(self):
+        c = self.setup_task()
+        self.run_check()
+        self.assess()
+        accepted = json.loads(self.state.read_text())["tasks"]["one"]
+        self.call("assess", "--task", "one", "--outcome", "conflict", "--evidence", "Changed acceptance")
+        before = json.loads(self.state.read_text())
+        self.assertEqual(before["tasks"]["one"]["scope_evidence"], accepted["scope_evidence"])
+        c["owner_request"] = "Owner follow-up: validate input as well as formatting"
+        c["must_happen"].append("reject invalid input")
+        c["checks"]["validation"] = {"argv": [sys.executable, "-c",
+            "from pathlib import Path; assert Path('source.txt').read_text() == 'validated\\n'"],
+            "timeout_seconds": 3}
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "two", "--follows", "one", "--repo", self.repo,
+                  "--contract", self.contract)
+        after = json.loads(self.state.read_text())
+        for field in ("deadline", "limits", "used_seconds", "attention_minutes", "reservations"):
+            self.assertEqual(before[field], after[field])
+        self.assertEqual(after["events"][:len(before["events"])], before["events"])
+        old, new = after["tasks"]["one"], after["tasks"]["two"]
+        for field in ("contract", "evidence", "external", "contract_conflicts"):
+            self.assertEqual(old[field], before["tasks"]["one"][field])
+        self.assertEqual(old["superseded_by"], "two")
+        self.assertEqual(new["follows"], "one")
+        self.assertEqual(new["contract"], c)
+        self.assertEqual(new["evidence"], [])
+        self.assertEqual(new["external"], [])
+        self.assertLessEqual(new["deadline"], old["deadline"])
+        self.call("init", code=2)
+        self.assertEqual(self.call("gate", "--task", "one", code=1)["validation"], "BLOCKED")
+        self.call("assess", "--task", "two", "--outcome", "met", "--evidence", "New criteria observed")
+        self.assertEqual(self.call("gate", "--task", "two", code=1)["missing"], ["test", "validation"])
+        self.call("run", "--task", "two", "--check", "validation", code=1)
+        self.assertEqual(self.call("gate", "--task", "two", code=1)["validation"], "FAIL")
+        (self.repo / "source.txt").write_text("validated\n")
+        self.call("run", "--task", "two", "--check", "test")
+        self.call("run", "--task", "two", "--check", "validation")
+        self.call("assess", "--task", "two", "--outcome", "met", "--evidence", "New criterion observed on changed tree")
+        self.assertEqual(self.call("gate", "--task", "two")["validation"], "PASS")
+        self.assertGreater(json.loads(self.state.read_text())["used_seconds"], before["used_seconds"])
+        # Editing the input contract cannot rewrite either frozen ledger contract.
+        self.contract.write_text("{}")
+        self.assertEqual(json.loads(self.state.read_text())["tasks"]["two"]["contract"], c)
+
+    def test_clarification_keeps_current_contract_and_task(self):
+        self.setup_task()
+        self.run_check()
+        self.assess()
+        before = json.loads(self.state.read_text())
+        self.call("assess", "--task", "one", "--outcome", "met",
+                  "--evidence", "Clarification: same acceptance examples, observed again")
+        self.assertEqual(self.gate(code=0)["validation"], "PASS")
+        after = json.loads(self.state.read_text())
+        self.assertEqual(list(after["tasks"]), ["one"])
+        self.assertEqual(after["tasks"]["one"]["contract"], before["tasks"]["one"]["contract"])
+
+    def test_followup_requires_valid_predecessor_and_authorization_reference(self):
+        c = self.setup_task()
+        before = self.state.read_bytes()
+        for predecessor in ("missing", "one"):
+            self.call("start", "--task", "two", "--follows", predecessor, "--repo", self.repo,
+                      "--contract", self.contract, code=2)
+            self.assertEqual(self.state.read_bytes(), before)
+        c["owner_request"] = "Owner follow-up"
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "two", "--follows", "one", "--repo", self.repo, "--contract", self.contract)
+        self.call("start", "--task", "three", "--follows", "one", "--repo", self.repo,
+                  "--contract", self.contract, code=2)
+
+    def test_pr_followup_retains_obligations_and_cannot_reuse_receipts(self):
+        c = self.setup_task()
+        c.update(mode="pr", required_external=["repo-ci", "final-adversarial-review", "security"])
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "pr", "--repo", self.repo, "--contract", self.contract)
+        self.call("run", "--task", "pr", "--check", "test")
+        self.call("assess", "--task", "pr", "--outcome", "met", "--evidence", "Observed")
+        head = self.git("rev-parse", "HEAD").decode().strip()
+        for kind in c["required_external"]:
+            self.call("receipt", "--task", "pr", "--kind", kind, "--reference", "/fixture/evidence",
+                      "--verified-by", "fixture", "--head", head, "--result", "PASS")
+        self.assertEqual(self.call("gate", "--task", "pr")["validation"], "PASS")
+        c["owner_request"] = "Owner follow-up"
+        for mode, external in (("local", []), ("pr", ["repo-ci", "final-adversarial-review"])):
+            bad = dict(c, mode=mode, required_external=external)
+            self.contract.write_text(json.dumps(bad))
+            self.call("start", "--task", "next", "--follows", "pr", "--repo", self.repo,
+                      "--contract", self.contract, code=2)
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "next", "--follows", "pr", "--repo", self.repo, "--contract", self.contract)
+        self.call("run", "--task", "next", "--check", "test")
+        self.call("assess", "--task", "next", "--outcome", "met", "--evidence", "Observed follow-up")
+        self.assertEqual(self.call("gate", "--task", "next", code=1)["validation"], "BLOCKED")
+
     def test_edits_and_new_files_invalidate_evidence(self):
         self.setup_task()
         self.run_check()
