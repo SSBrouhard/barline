@@ -84,7 +84,7 @@ New ledgers use format `version: 2` with `tasks` and `events`. Tasks have no dea
 
 Format-1 ledgers from the budgeted v0.1 implementation are rejected unchanged, including expired ledgers. There is no compatibility mode, automatic migration or reset. Before continuing one, back up the original, inspect held reservations and unfinished checks, and verify/clean up any owned work. A reviewed conversion must retain task IDs, contracts, links, conflicts, evidence, hypotheses, checkpoints and event history in the same session; remove the obsolete session accounting fields and task deadlines, and set the format to 2. An unfinished check needs a BLOCKED result so an earlier PASS is not exposed. Preserve the old ledger as the historical source for removed accounting. Update recovered checkpoint ledgers consistently and re-confirm any changed archive identity. Do not simply change the version number or initialize another ledger to abandon history. No existing session files are converted by this code change.
 
-## What v0.1 controls
+## What v0.2 controls
 
 | Boundary | Behavior |
 | --- | --- |
