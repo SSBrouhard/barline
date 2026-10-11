@@ -400,7 +400,11 @@ class HarnessTests(unittest.TestCase):
         self.call("durable", "--task", "one", "--location", "test persistent destination receipt")
         self.call("resume", "--task", "one", "--expect", original)
         extracted = self.root / "extracted"
-        with tarfile.open(output) as tar: tar.extractall(extracted, filter="data")
+        # This archive was created from this test's trusted temporary fixture.
+        # Python 3.10 before 3.10.12 has no extraction-filter API.
+        with tarfile.open(output) as tar:
+            options = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            tar.extractall(extracted, **options)
         restored = self.root / "restored"
         subprocess.check_call(["git", "clone", "-q", str(extracted / "history.bundle"), str(restored)])
         for source in (extracted / "worktree").iterdir():
