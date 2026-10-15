@@ -2,7 +2,7 @@
 
 Read `AGENT.md` before working in this project. It is the session guide for the Lean harness.
 
-The installed executable is `lean.py` in this directory. Invoke it with Python 3.10 or newer. Keep session ledgers, contracts and check logs outside this repository, in a separate session directory under the sibling `lean-sessions` folder. Use a distinct ledger for each independent T3 conversation. Continue an existing conversation with its existing ledger to preserve its history.
+The installed executable is `lean.py` in this directory. Invoke it with Python 3.10 or newer. Keep session ledgers, contracts and check logs outside this repository, in a separate session directory under the sibling `lean-sessions` folder. Use a distinct lead-owned ledger for each independent T3 conversation; delegated children follow their briefs and do not initialize separate ledgers. Continue an existing conversation with its existing ledger to preserve its history.
 
 Use the harness for requested work: freeze the task contract, run named checks, assess actual behavior, and report the gate result. Read and retain the target repository's own instructions. The harness records exact-tree check evidence; it does not intercept every T3 tool call or measure model usage.
 

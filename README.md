@@ -53,7 +53,9 @@ The canonical [PR Freeze Bar](https://github.com/SSBrouhard/Agent-Skills/blob/ma
 
 ## Delegation and stopping
 
-Only the lead mutates the ledger and owns integration, evidence and completion. Specialist delegation is optional when authorized and useful or required by repository policy. Give each specialist a narrow assignment, clear deliverables, evidence requirements and explicit authority boundaries. Host permissions and repository rules remain authoritative; the harness does not spawn or supervise specialists.
+Only the lead mutates the ledger and owns integration, evidence and completion. [AGENT.md](AGENT.md) is the canonical delegation decision rule: the lead may choose useful specialists within authorized scope without redundant approval, and keeps small or sequential work direct. Children follow self-contained briefs and do not initialize separate ledgers. Concurrent writers use separate worktrees; read-only children may safely share a checkout. Host permissions and repository rules remain authoritative; the harness does not spawn or supervise specialists.
+
+T3's `delegate_task` supplies child task records, provider/model selection, worktree isolation and async completion notifications. Worktree children start from the parent's local commit; uncommitted edits are absent. The lead verifies the base commit, reads `task_status` and the durable child timeline, inspects actual artifacts and runs named checks. T3 limits a child's runtime mode to the parent's ceiling. A narrower mode can require human approval; it does not make the child read-only. No-edit, no-further-delegation and publication restrictions remain instructions even when children have orchestration tools. See [PRINCIPLES.md](PRINCIPLES.md) for optional, pinned, on-demand decision guidance.
 
 The executable exclusively locks the ledger and writes it atomically. It records a BLOCKED check result before launch and replaces that provisional result only after observing completion. A lead crash therefore cannot expose an older PASS for the same check/tree. The record includes the process group when known; after a crash, verify and clean up owned work before rerunning. Never blindly signal a recorded PID, which may have been reused. Check timeouts and interruption terminate the owned process group. Check output goes to local log files; log size is not capped.
 
@@ -68,6 +70,8 @@ python3 /path/lean-harness/lean.py --state /path/work/session.json checkpoint --
 ```
 
 The archive contains Git history, the actual nonignored working files (including untracked work), staged patch, ledger, check logs and a short resume note. Deleted files are absent from `worktree/`; recovery instructions explain removal before overlay. Submodules/special files are rejected rather than incompletely preserved. Ignored files, credentials, external services and installed dependencies are outside the archive's coverage. Use an adapter if unfinished work depends on them. Tracked/nonignored files are included as-is; preserve only in an authorized destination with the appropriate access.
+
+Child tasks and separate worktrees are outside this archive. Before checkpointing, consult actual T3 records and include task IDs/providers, status/evidence, worktree/branch, integration state and remaining work in `--next` or a referenced external handoff. Separately preserve unintegrated artifacts when needed. On resume, read `task_status` and inspect those worktrees before repeating work; do not automatically cancel tasks or delete worktrees. This uses the existing checkpoint format.
 
 Local archives are explicitly **unconfirmed**. Save the archive AND the latest session ledger in an authorized persistent destination. After observing its successful save receipt, record:
 
@@ -90,7 +94,7 @@ Format-1 ledgers from the budgeted v0.1 implementation are rejected unchanged, i
 | --- | --- |
 | Checks executed through this CLI | Allowlisted argv, per-command timeout, exact-tree evidence |
 | Agent's normal coding and tool use | Session guidance; no sandbox or interception |
-| Delegation | Narrow assignments; host permissions and repository rules |
+| Delegation | Lead-owned decisions and briefs; T3 runtime-mode ceiling; other scope restrictions are instructional |
 | Human attention | Task boundaries, evidence and stopping; no numerical accounting |
 | CI/publication | No launcher or cost meter; external requirements remain explicit |
 | Persistent checkpoint | Archive verified locally, then operator-confirmed save receipt |
