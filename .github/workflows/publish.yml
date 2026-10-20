@@ -1,0 +1,77 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Publish this exact metadata version from its v-prefixed tag'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Public release is a separate owner action. Private preparation cannot upload.
+    if: startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_REF: ${{ github.ref_name }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - name: Verify release version and run tests
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open('pyproject.toml', 'rb') as source:
+              version = tomllib.load(source)['project']['version']
+          if os.environ['RELEASE_VERSION'] != version or os.environ['RELEASE_REF'] != 'v' + version:
+              raise SystemExit('Version confirmation, tag and package metadata must match')
+          PY
+          python -B -m unittest discover -s tests -v
+      - name: Build and validate
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+          for artifact in dist/*; do
+            install_env=$(mktemp -d "$RUNNER_TEMP/barline-install.XXXXXX")
+            python -m venv "$install_env"
+            "$install_env/bin/python" -m pip install "$artifact"
+            python -B tests/smoke_distribution.py "$install_env/bin/python"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: pypi
+      url: https://pypi.org/p/barline
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: distributions
+          path: dist/
+      - name: Publish with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

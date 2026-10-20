@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barline"
+version = "0.3.0"
+description = "Exact-tree check evidence and optional completion guards for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Stephen Brouhard"}]
+keywords = ["coding-agents", "validation", "completion-hooks", "git"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.scripts]
+barline = "barline.core:main"
+barline-recover = "barline.recovery:main"
+barline-hook = "barline.hook:main"
+
+[project.urls]
+Homepage = "https://github.com/SSBrouhard/barline"
+Repository = "https://github.com/SSBrouhard/barline"
+Issues = "https://github.com/SSBrouhard/barline/issues"
+
+[tool.setuptools]
+packages = ["barline"]

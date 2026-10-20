@@ -17,7 +17,7 @@ import unittest
 from unittest import mock
 
 CLI = Path(__file__).resolve().parents[1] / "lean.py"
-SPEC = importlib.util.spec_from_file_location("lean_harness", CLI)
+SPEC = importlib.util.spec_from_file_location("barline_core_under_test", CLI.parent / "barline" / "core.py")
 HARNESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HARNESS)
 
