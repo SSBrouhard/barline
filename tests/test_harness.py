@@ -1,4 +1,9 @@
 import json
+import copy
+import contextlib
+import hashlib
+import importlib.util
+import io
 import os
 import signal
 from pathlib import Path
@@ -8,8 +13,12 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 CLI = Path(__file__).resolve().parents[1] / "lean.py"
+SPEC = importlib.util.spec_from_file_location("lean_harness", CLI)
+HARNESS = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessTests(unittest.TestCase):
@@ -450,6 +459,228 @@ class HarnessTests(unittest.TestCase):
         s = json.loads(self.state.read_text())
         self.assertEqual(len(s["tasks"]["one"]["evidence"]), 1)
         self.assertEqual(s["tasks"]["one"]["scope_outcome"], "unknown")
+
+    def test_linked_checkpoint_preserves_whole_session_logs(self):
+        c = self.setup_task()
+        self.run_check()
+        c["owner_request"] = "authorized linked fixture follow-up"
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "two", "--follows", "one", "--repo", self.repo,
+                  "--contract", self.contract)
+        self.call("run", "--task", "two", "--check", "test")
+        output = self.root / "linked.tgz"
+        self.call("checkpoint", "--task", "two", "--output", output, "--next", "Continue")
+        with tarfile.open(output) as tar:
+            embedded = json.load(tar.extractfile("state.json"))
+            for task in embedded["tasks"].values():
+                for evidence in task["evidence"]:
+                    member = "logs/" + Path(evidence["log"]).name
+                    self.assertIn(member, tar.getnames())
+                    self.assertEqual(tar.extractfile(member).read(), Path(evidence["log"]).read_bytes())
+
+    def assert_manifest(self, output, session):
+        with tarfile.open(output) as tar:
+            manifest = json.load(tar.extractfile("log-manifest.json"))
+            expected = {(task_id, i) for task_id, task in session["tasks"].items()
+                        for i, _ in enumerate(task["evidence"])}
+            self.assertEqual({(r["task"], r["evidence_index"]) for r in manifest["references"]}, expected)
+            for ref in manifest["references"]:
+                if ref["availability"] == "available":
+                    self.assertEqual(hashlib.sha256(tar.extractfile(ref["member"]).read()).hexdigest(),
+                                     ref["sha256"])
+            payloads = [m.name for m in tar.getmembers() if m.isfile() and m.name.startswith("logs/")]
+            self.assertEqual(len(payloads), len(set(payloads)))
+            return manifest, payloads
+
+    def test_checkpoint_manifest_deduplicates_aliases_without_basename_collisions(self):
+        self.setup_task()
+        self.run_check()
+        session = json.loads(self.state.read_text())
+        task = session["tasks"]["one"]
+        source = Path(task["evidence"][0]["log"])
+        for folder, contents in (("alias", None), ("collision", b"distinct log bytes")):
+            other = self.root / folder / source.name
+            other.parent.mkdir()
+            if contents is None:
+                os.link(source, other)
+            else:
+                other.write_bytes(contents)
+            record = copy.deepcopy(task["evidence"][0])
+            record["log"] = str(other)
+            task["evidence"].append(record)
+        # The same literal path and a distinct hardlink are both single-payload references.
+        task["evidence"].append(copy.deepcopy(task["evidence"][0]))
+        output = self.root / "aliases.tgz"
+        HARNESS.checkpoint(session, task, output, "Continue")
+        manifest, payloads = self.assert_manifest(output, session)
+        refs = manifest["references"]
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(refs[0]["member"], refs[1]["member"])
+        self.assertEqual(refs[0]["member"], refs[3]["member"])
+        self.assertNotEqual(refs[0]["member"], refs[2]["member"])
+
+    def test_checkpoint_other_repository_logs_but_only_selected_checkout(self):
+        self.setup_task()
+        self.run_check()
+        other = self.root / "other"
+        other.mkdir()
+        for args in (["init", "-q"], ["config", "user.email", "test@example.invalid"],
+                     ["config", "user.name", "Harness test"]):
+            self.git(*args, repo=other)
+        (other / "other-only.txt").write_text("Other repository")
+        self.git("add", ".", repo=other)
+        self.git("commit", "-qm", "Other fixture", repo=other)
+        self.call("start", "--task", "other", "--repo", other, "--contract", self.contract)
+        self.call("run", "--task", "other", "--check", "test")
+        output = self.root / "other.tgz"
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue")
+        self.assert_manifest(output, json.loads(self.state.read_text()))
+        with tarfile.open(output) as tar:
+            self.assertIn("worktree/source.txt", tar.getnames())
+            self.assertNotIn("worktree/other-only.txt", tar.getnames())
+
+    def test_checkpoint_missing_completed_logs_preserves_disk_and_memory(self):
+        for completed in ("PASS", "FAIL", "INCONCLUSIVE", "BLOCKED"):
+            with self.subTest(completed=completed):
+                if not self.state.exists():
+                    self.setup_task()
+                    self.run_check()
+                session = json.loads(self.state.read_text())
+                task = session["tasks"]["one"]
+                task["evidence"][0]["status"] = completed
+                task["evidence"][0]["exit_code"] = None
+                Path(task["evidence"][0]["log"]).unlink(missing_ok=True)
+                before = copy.deepcopy(session)
+                disk = self.state.read_bytes()
+                output = self.root / (completed + ".tgz")
+                with self.assertRaisesRegex(HARNESS.Denied, "Completed check log missing"):
+                    HARNESS.checkpoint(session, task, output, "Continue")
+                self.assertEqual(session, before)
+                self.assertEqual(self.state.read_bytes(), disk)
+                self.assertFalse(output.exists())
+                # Exercise the actual CLI's same no-write boundary as well.
+                self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue", code=2)
+                self.assertEqual(self.state.read_bytes(), disk)
+
+    def test_checkpoint_unfinished_log_histories_are_honestly_accounted(self):
+        self.setup_task()
+        self.run_check()
+        original = json.loads(self.state.read_text())
+        for history in ("before-open", "after-open", "deleted-later", "legacy-before-open"):
+            with self.subTest(history=history):
+                session = copy.deepcopy(original)
+                task = session["tasks"]["one"]
+                evidence = task["evidence"][0]
+                evidence.update(status="BLOCKED", exit_code=None,
+                                detail="Check started without a recorded completion; verify owned process before rerunning")
+                session["events"] = [e for e in session["events"] if e["event"] != "check-finish"]
+                log = Path(evidence["log"])
+                if history == "legacy-before-open":
+                    evidence.pop("attempt_id", None)
+                if history == "after-open":
+                    log.write_bytes(b"")
+                elif history == "deleted-later":
+                    log.write_bytes(b"partial output")
+                    log.unlink()
+                else:
+                    log.unlink(missing_ok=True)
+                output = self.root / (history + ".tgz")
+                HARNESS.checkpoint(session, task, output, "Inspect owned process")
+                manifest, _ = self.assert_manifest(output, session)
+                ref = manifest["references"][0]
+                if history == "after-open":
+                    self.assertEqual(ref["availability"], "available")
+                    self.assertEqual(ref["sha256"], hashlib.sha256(b"").hexdigest())
+                else:
+                    self.assertEqual(ref["availability"], "unavailable")
+                    self.assertEqual(ref["creation_history"], "unknown")
+                    self.assertNotIn("member", ref)
+
+    def test_checkpoint_hashes_captured_log_bytes_despite_source_log_movement(self):
+        self.setup_task()
+        self.run_check()
+        session = json.loads(self.state.read_text())
+        task = session["tasks"]["one"]
+        log = Path(task["evidence"][0]["log"])
+        original = log.read_bytes()
+        copy_log = HARNESS.shutil.copyfileobj
+        def moving_log(source, destination, *args, **kwargs):
+            log.rename(log.with_suffix(".moved"))
+            log.write_bytes(b"replacement before archive publication")
+            return copy_log(source, destination, *args, **kwargs)
+        output = self.root / "moving-log.tgz"
+        with mock.patch.object(HARNESS.shutil, "copyfileobj", side_effect=moving_log):
+            HARNESS.checkpoint(session, task, output, "Continue")
+        manifest, _ = self.assert_manifest(output, session)
+        with tarfile.open(output) as tar:
+            self.assertEqual(tar.extractfile(manifest["references"][0]["member"]).read(), original)
+        self.assertNotEqual(log.read_bytes(), original)
+
+    def test_checkpoint_source_movement_and_archive_replace_failure_are_atomic(self):
+        self.setup_task()
+        self.run_check()
+        for failure in ("source-movement", "archive-replace"):
+            with self.subTest(failure=failure):
+                session = json.loads(self.state.read_text())
+                before = copy.deepcopy(session)
+                disk = self.state.read_bytes()
+                output = self.root / (failure + ".tgz")
+                add = HARNESS.tarfile.TarFile.add
+                def moving_source(tar, name, *args, **kwargs):
+                    result = add(tar, name, *args, **kwargs)
+                    if kwargs.get("arcname") == "worktree/source.txt":
+                        (self.repo / "source.txt").write_text("changed while archiving")
+                    return result
+                patch = (mock.patch.object(HARNESS.tarfile.TarFile, "add", new=moving_source)
+                         if failure == "source-movement" else
+                         mock.patch.object(HARNESS.os, "replace", side_effect=OSError("replace fault")))
+                with patch, self.assertRaises((HARNESS.Denied, OSError)):
+                    HARNESS.checkpoint(session, session["tasks"]["one"], output, "Continue")
+                self.assertEqual(session, before)
+                self.assertEqual(self.state.read_bytes(), disk)
+                self.assertFalse(output.exists())
+                self.assertEqual(list(self.root.glob(".checkpoint-*")), [])
+
+    def test_checkpoint_hash_failure_reports_published_archive_preserves_memory(self):
+        self.setup_task()
+        self.run_check()
+        session = json.loads(self.state.read_text())
+        before = copy.deepcopy(session)
+        disk = self.state.read_bytes()
+        output = self.root / "hash-fault.tgz"
+        digest = HARNESS.file_sha256
+        def failing_hash(path):
+            if Path(path).resolve() == output.resolve():
+                raise OSError("hash fault")
+            return digest(path)
+        with mock.patch.object(HARNESS, "file_sha256", side_effect=failing_hash):
+            with self.assertRaises(HARNESS.CheckpointPublished) as raised:
+                HARNESS.checkpoint(session, session["tasks"]["one"], output, "Continue")
+        self.assertEqual(raised.exception.archive, str(output.resolve()))
+        self.assertIsNone(raised.exception.sha256)
+        self.assertTrue(output.exists())
+        self.assert_manifest(output, session)
+        self.assertEqual(session, before)
+        self.assertEqual(self.state.read_bytes(), disk)
+
+    def test_checkpoint_ledger_save_failure_reports_archive_identity(self):
+        self.setup_task()
+        self.run_check()
+        disk = self.state.read_bytes()
+        output = self.root / "save-fault.tgz"
+        stderr = io.StringIO()
+        with mock.patch.object(HARNESS, "save", side_effect=OSError("ledger save fault")):
+            with contextlib.redirect_stderr(stderr):
+                result = HARNESS.main(["--state", str(self.state), "checkpoint", "--task", "one",
+                                       "--output", str(output), "--next", "Continue"])
+        self.assertEqual(result, 2)
+        error = json.loads(stderr.getvalue())
+        self.assertEqual(error["archive"], str(output.resolve()))
+        self.assertEqual(error["sha256"], hashlib.sha256(output.read_bytes()).hexdigest())
+        self.assertEqual(error["ledger_publication"], "unconfirmed")
+        self.assertEqual(self.state.read_bytes(), disk)
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue", code=2)
+        self.assertEqual(self.state.read_bytes(), disk)
 
     def test_checkpoint_restore_preserves_dirty_work_and_evidence(self):
         self.setup_task()

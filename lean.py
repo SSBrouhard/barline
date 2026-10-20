@@ -2,6 +2,7 @@
 """Lean task harness. Python 3.10+, Git, POSIX. No services or dependencies."""
 import argparse
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -9,6 +10,8 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -18,6 +21,25 @@ import time
 
 class Denied(Exception):
     pass
+
+
+class CheckpointPublished(Denied):
+    def __init__(self, archive, digest, error):
+        self.archive, self.sha256 = str(archive), digest
+        super().__init__(f"Checkpoint archive published at {archive}; recover it before retrying. "
+                         f"Ledger publication not confirmed: {error}")
+
+
+def hash_stream(stream):
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def file_sha256(path):
+    with open(path, "rb") as stream:
+        return hash_stream(stream)
 
 
 def require(condition, message):
@@ -167,7 +189,7 @@ def execute(s, t, name, state_path):
     logs = state_path.parent / (state_path.stem + "-logs")
     logs.mkdir(exist_ok=True)
     log = logs / (rid + ".log")
-    e = {"check": name, "status": "BLOCKED", "exit_code": None, "argv": c["argv"],
+    e = {"attempt_id": rid, "check": name, "status": "BLOCKED", "exit_code": None, "argv": c["argv"],
          "expected_exit": c.get("expected_exit", 0), "fingerprint": before["fingerprint"],
          "head": before["head"], "log": str(log),
          "detail": "Check started without a recorded completion; verify owned process before rerunning",
@@ -206,55 +228,111 @@ def execute(s, t, name, state_path):
     return e
 
 
+def checkpoint_logs(s, stage):
+    """Capture the embedded ledger's log closure, keeping physical aliases together."""
+    references, physical, members = [], {}, set()
+    finished = {e["id"] for e in s["events"] if e.get("event") == "check-finish"}
+    for task_id, task in s["tasks"].items():
+        for index, evidence in enumerate(task["evidence"]):
+            source = Path(evidence["log"])
+            ref = {"task": task_id, "evidence_index": index, "source": str(source)}
+            try:
+                require(stat.S_ISREG(source.stat().st_mode), f"Check log is not a regular file: {source}")
+                with source.open("rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    require(stat.S_ISREG(info.st_mode), f"Check log is not a regular file: {source}")
+                    key = (info.st_dev, info.st_ino)
+                    if key not in physical:
+                        member = "logs/" + source.name
+                        suffix = 1
+                        while member in members:
+                            member = f"logs/{suffix}-{source.name}"
+                            suffix += 1
+                        members.add(member)
+                        captured = stage / member
+                        captured.parent.mkdir(exist_ok=True)
+                        with captured.open("wb") as destination:
+                            shutil.copyfileobj(stream, destination)
+                        physical[key] = {"member": member, "sha256": file_sha256(captured)}
+                    ref.update(availability="available", **physical[key])
+            except FileNotFoundError:
+                attempt = evidence.get("attempt_id", source.stem)
+                unfinished = (evidence.get("status") == "BLOCKED" and
+                              evidence.get("exit_code") is None and attempt not in finished and
+                              evidence.get("detail") ==
+                              "Check started without a recorded completion; verify owned process before rerunning")
+                require(unfinished, f"Completed check log missing for task {task_id}, "
+                        f"evidence {index}: {source}; recover the log before checkpointing")
+                ref.update(availability="unavailable", creation_history="unknown",
+                           reason="Unfinished attempt log absent; it may never have opened or may have been deleted")
+            references.append(ref)
+    manifest = {"version": 1, "references": references}
+    (stage / "log-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def checkpoint(s, t, output, note):
     output = Path(output).resolve()
     repo = Path(t["repo"])
     require(not output.is_relative_to(repo), "Checkpoint must live outside the source repository")
     require(not output.exists(), "Checkpoint already exists; use a new path")
     current = snapshot(repo)
-    t["work_state"] = "PAUSED"
-    t["checkpoint_snapshot"] = current
-    t["next"] = note
-    t["checkpoint"] = {"path": str(output), "durability": "unconfirmed"}
+    # Archive failure must not leak a PAUSED state into the caller's live session.
+    staged = copy.deepcopy(s)
+    task_id = next(key for key, value in s["tasks"].items() if value is t)
+    target = staged["tasks"][task_id]
+    target.update(work_state="PAUSED", checkpoint_snapshot=current, next=note,
+                  checkpoint={"path": str(output), "durability": "unconfirmed"})
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as td:
-        stage = Path(td)
-        git(repo, "bundle", "create", str(stage / "history.bundle"), "--all")
-        (stage / "state.json").write_text(json.dumps(s, indent=2))
-        (stage / "resume.md").write_text(
-            f"# Resume {t['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(t)['validation']}.\n"
-            f"Head: {current['head']}\nFingerprint: {current['fingerprint']}\n"
-            f"Failed hypotheses: {t['failed_hypotheses']}.\nNext: {note}\n\n"
-            "Read state.json for the frozen contract, original request, evidence and session history.\n"
-            "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
-            "then record its receipt using `durable`. Do not push merely to save state.\n"
-            "Recovery: clone history.bundle into a NEW directory, checkout the recorded head, "
-            "remove files absent from the worktree member list, overlay worktree/, then replay index.patch. "
-            "Restore state.json and logs beside the repo, update only the repo/log path mappings, "
-            "and compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
-        (stage / "index.patch").write_bytes(git(repo, "diff", "--cached", "--binary", "HEAD"))
-        fd, tmp = tempfile.mkstemp(dir=output.parent, prefix=".checkpoint-")
-        os.close(fd)
-        try:
-            with tarfile.open(tmp, "w:gz") as tar:
-                for item in stage.iterdir():
-                    tar.add(item, arcname=item.name)
-                for name in current["files"]:
-                    p = repo / name
-                    if p.exists() or p.is_symlink():
-                        tar.add(p, arcname="worktree/" + name, recursive=False)
-                for e in t["evidence"]:
-                    if Path(e["log"]).exists():
-                        tar.add(e["log"], arcname="logs/" + Path(e["log"]).name)
-            require(snapshot(repo)["fingerprint"] == current["fingerprint"], "Source changed while archiving; retry")
-            with tarfile.open(tmp) as tar:
-                require("history.bundle" in tar.getnames() and "state.json" in tar.getnames(), "Incomplete archive")
-            os.replace(tmp, output)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    t["checkpoint"]["sha256"] = digest
+    published, digest = False, None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stage = Path(td)
+            manifest = checkpoint_logs(staged, stage)
+            git(repo, "bundle", "create", str(stage / "history.bundle"), "--all")
+            (stage / "state.json").write_text(json.dumps(staged, indent=2))
+            (stage / "resume.md").write_text(
+                f"# Resume {target['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(target)['validation']}.\n"
+                f"Head: {current['head']}\nFingerprint: {current['fingerprint']}\n"
+                f"Failed hypotheses: {target['failed_hypotheses']}.\nNext: {note}\n\n"
+                "Read state.json for the frozen contract, original request, evidence and session history.\n"
+                "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
+                "then record its receipt using `durable`. Do not push merely to save state.\n"
+                "Recovery: clone history.bundle into a NEW directory, checkout the recorded head, "
+                "remove files absent from the worktree member list, overlay worktree/, then replay index.patch. "
+                "Restore state.json and logs beside the repo, update only the repo/log path mappings, "
+                "and compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
+            (stage / "index.patch").write_bytes(git(repo, "diff", "--cached", "--binary", "HEAD"))
+            fd, tmp = tempfile.mkstemp(dir=output.parent, prefix=".checkpoint-")
+            os.close(fd)
+            try:
+                with tarfile.open(tmp, "w:gz") as tar:
+                    for item in stage.iterdir():
+                        tar.add(item, arcname=item.name)
+                    for name in current["files"]:
+                        p = repo / name
+                        if p.exists() or p.is_symlink():
+                            tar.add(p, arcname="worktree/" + name, recursive=False)
+                require(snapshot(repo)["fingerprint"] == current["fingerprint"], "Source changed while archiving; retry")
+                with tarfile.open(tmp) as tar:
+                    require("history.bundle" in tar.getnames() and "state.json" in tar.getnames(), "Incomplete archive")
+                    for ref in manifest["references"]:
+                        if ref["availability"] == "available":
+                            with tar.extractfile(ref["member"]) as stream:
+                                require(hash_stream(stream) == ref["sha256"], "Archived log digest differs")
+                os.replace(tmp, output)
+                published = True
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        digest = file_sha256(output)
+    except (Denied, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+        if published:
+            raise CheckpointPublished(output, digest, exc) from exc
+        raise
+    target["checkpoint"]["sha256"] = digest
+    t.clear()
+    t.update(target)
     return {"archive": str(output), "sha256": digest, "durability": "unconfirmed", "work_state": "PAUSED"}
 
 
@@ -392,13 +470,21 @@ def main(argv=None):
                                               "result": a.result, "assurance": "Lead-recorded external verification; CLI does not fetch or authenticate source"})
                         result = gate(t)
             s["events"].append({"event": a.command, "time": time.time()})
-            save(path, s)
+            try:
+                save(path, s)
+            except OSError as exc:
+                if a.command == "checkpoint":
+                    raise CheckpointPublished(result["archive"], result["sha256"], exc) from exc
+                raise
             print(json.dumps(result, indent=2))
             if a.command == "gate": return 0 if result["validation"] == "PASS" else 1
             if a.command == "run": return 0 if result["status"] == "PASS" else 1
             return 0
-    except (Denied, OSError, ValueError, KeyError, TypeError) as exc:
-        print(json.dumps({"status": "BLOCKED", "reason": str(exc)}), file=sys.stderr)
+    except (Denied, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+        error = {"status": "BLOCKED", "reason": str(exc)}
+        if isinstance(exc, CheckpointPublished):
+            error.update(archive=exc.archive, sha256=exc.sha256, ledger_publication="unconfirmed")
+        print(json.dumps(error), file=sys.stderr)
         return 2
 
 
