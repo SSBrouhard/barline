@@ -1,5 +1,8 @@
 # Optional completion guard
 
+Installed use: replace `python3 -B /absolute/path/to/barline/hooks/stop.py` in the examples with the absolute path to your environment's `barline-hook` executable. Find it with `command -v barline-hook`. Keep that environment installed and use its absolute path in native configuration. The source-checkout commands below remain supported.
+
+
 The shared guard observes one explicitly enrolled native lead session and task. It never runs checks, assesses acceptance, records CI/review receipts, fetches evidence or changes a ledger. Client protocol adapters and opt-in registration are separate from this shared boundary. No configuration is activated by adding these files.
 
 `gate` and `status` retain their existing ledger-writing behavior. Hooks use the new read-only `observe` boundary instead:
@@ -64,7 +67,7 @@ Context operations use an existing exclusive nonblocking lock and atomic replace
 | Other active result | `block` | Continue only authorized validation or explicitly record a handoff |
 | Two failed hypotheses | `block` | Stop repairs; checkpoint for diagnosis with new causal evidence or record a handoff |
 
-The core cannot authenticate lead-recorded acceptance, external verification or handoff reasons. Optional client hooks can also be skipped or defeated by native trust settings, timeouts, crashes and continuation caps. A forced native stop never changes Lean evidence or becomes a PASS. Fixture tests establish the shared boundary only; they do not prove a native client loaded or enforced a hook.
+The core cannot authenticate lead-recorded acceptance, external verification or handoff reasons. Optional client hooks can also be skipped or defeated by native trust settings, timeouts, crashes and continuation caps. A forced native stop never changes Barline evidence or becomes a PASS. Fixture tests establish the shared boundary only; they do not prove a native client loaded or enforced a hook.
 
 ## Native command adapters
 
@@ -79,7 +82,7 @@ The identity fields are Claude `session_id`/`prompt_id`, Codex `session_id`/`tur
 Choose the exact task and the native lead session's identity from authoritative native session evidence. Create the external parent directory first, then enroll explicitly:
 
 ```sh
-python3 -B /absolute/path/to/lean-harness/hooks/stop.py enroll \
+python3 -B /absolute/path/to/barline/hooks/stop.py enroll \
   --client codex --session-id ACTUAL_NATIVE_SESSION_ID \
   --repo /absolute/target-checkout --state /external/session.json \
   --task exact-task --binding /external/codex-binding.json
@@ -94,7 +97,7 @@ Register both `UserPromptSubmit` and `Stop`. The prompt event captures the nativ
 For a legitimate input request, progress update or external blocker, use the explicit command before ending the turn:
 
 ```sh
-python3 -B /absolute/path/to/lean-harness/hooks/stop.py handoff \
+python3 -B /absolute/path/to/barline/hooks/stop.py handoff \
   --binding /external/codex-binding.json \
   --reason input --next 'Ask the owner for the missing decision'
 ```
@@ -127,12 +130,12 @@ Native loading and Stop behavior were observed in the following exact versions a
 
 | Client | Observed launch | Observed outcomes and limits |
 | --- | --- | --- |
-| Claude Code 2.1.304 | Print mode with explicit disposable settings, other settings sources excluded and session persistence disabled | Current PASS allowed Stop. Nonpassing evidence blocked repeated stops. An explicit input handoff allowed a question without acceptance; a later native prompt cleared it and blocked. Disabled hooks were inactive. A missing executable (exit 127) and native hook timeout allowed the client to finish. The native block cap ended the turn after its warning of nine consecutive blocks; Lean stayed nonpassing. SIGINT interrupted a later blocked turn. Print mode does not establish interactive workspace or hook trust behavior. |
-| Codex CLI 0.163.0 | Interactive TUI with disposable CODEX_HOME, normal project trust and exact two-hook review | Untrusted hooks were skipped. Trusted hooks blocked nonpassing stops, allowed current PASS and allowed an explicit input handoff; a new native prompt cleared the handoff. Native continuations in this tested version retained the same turn_id and set stop_hook_active. Missing-executable and native-timeout failures returned to idle without a Lean PASS. User interruption ended repeated rejection. No native cap was reached in the bounded run. Fresh recovery supported immediate explicit enrollment and a valid native pause with unchanged ledger bytes. |
+| Claude Code 2.1.304 | Print mode with explicit disposable settings, other settings sources excluded and session persistence disabled | Current PASS allowed Stop. Nonpassing evidence blocked repeated stops. An explicit input handoff allowed a question without acceptance; a later native prompt cleared it and blocked. Disabled hooks were inactive. A missing executable (exit 127) and native hook timeout allowed the client to finish. The native block cap ended the turn after its warning of nine consecutive blocks; Barline stayed nonpassing. SIGINT interrupted a later blocked turn. Print mode does not establish interactive workspace or hook trust behavior. |
+| Codex CLI 0.163.0 | Interactive TUI with disposable CODEX_HOME, normal project trust and exact two-hook review | Untrusted hooks were skipped. Trusted hooks blocked nonpassing stops, allowed current PASS and allowed an explicit input handoff; a new native prompt cleared the handoff. Native continuations in this tested version retained the same turn_id and set stop_hook_active. Missing-executable and native-timeout failures returned to idle without a Barline PASS. User interruption ended repeated rejection. No native cap was reached in the bounded run. Fresh recovery supported immediate explicit enrollment and a valid native pause with unchanged ledger bytes. |
 | Grok CLI 1.0.62 | Interactive PTY with disposable GROK_HOME, normal folder trust and a dedicated leader socket; then headless -p using that isolated trusted profile | Native inventory contained one UserPromptSubmit and one Stop hook, with compatibility hook/MCP discovery disabled. Current PASS allowed Stop. Nonpassing evidence blocked eight times, then the native continuation cap ended the turn with acceptance unchanged. An explicit input handoff allowed a question; the next prompt cleared it and blocked again. An untrusted folder ran no hooks. Missing executables and native timeouts failed open. Interactive cancellation preserved nonacceptance. |
 
-These are observed workflow guards, not guarantees that a client cannot stop. Native failures, trust settings, cancellation and continuation caps can bypass enforcement while the Lean task remains nonpassing. A stopped client, exit 0 or a model's final text is never a Lean completion receipt. Do not raise native caps or install trust bypasses automatically.
+These are observed workflow guards, not guarantees that a client cannot stop. Native failures, trust settings, cancellation and continuation caps can bypass enforcement while the Barline task remains nonpassing. A stopped client, exit 0 or a model's final text is never a Barline completion receipt. Do not raise native caps or install trust bypasses automatically.
 
 The smoke fixtures used explicitly selected existing configured model routes; credentials stayed in process memory/environment. No global/fleet hook activation or trust configuration was changed. Test processes were stopped or exited; local disposable fixtures and sanitized outcome receipts remain under the originating task's work/native-smoke directory. Exact commands, outcomes, recovery rebinding evidence and remaining coverage limits are recorded under [PORT-86](https://linear.app/stephen-portfolio/issue/PORT-86). Interactive Claude trust, other versions/modes, other operating systems and T3-mediated paths remain unverified. Revalidate after native protocol or trust changes, and enroll a fresh binding after recovery.
 
-The protocol sources consulted for this adapter implementation are the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop), and [Grok CLI hooks guide](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md). Native timeout/crash/malformed-output behavior can fail open, particularly in Grok. A client stopping despite a guard failure is a protection limit, never evidence that Lean passed.
+The protocol sources consulted for this adapter implementation are the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop), and [Grok CLI hooks guide](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md). Native timeout/crash/malformed-output behavior can fail open, particularly in Grok. A client stopping despite a guard failure is a protection limit, never evidence that Barline passed.

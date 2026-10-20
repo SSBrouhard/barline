@@ -1,0 +1,14 @@
+{
+  "goal": "Implement the requested npm project change.",
+  "owner_request": "Replace with the current user request reference.",
+  "mode": "local",
+  "non_goals": ["Registry publication", "Unrelated dependency upgrades"],
+  "must_happen": ["Task-specific observable behavior", "Existing tests remain passing"],
+  "must_never": ["Treat local tests as proof of hosted CI"],
+  "policy_sources": ["Read the target project's current instructions, package.json and CI workflow"],
+  "checks": {
+    "build": {"argv": ["npm", "run", "build"], "timeout_seconds": 120, "expected_exit": 0},
+    "test": {"argv": ["npm", "test"], "timeout_seconds": 120, "expected_exit": 0}
+  },
+  "required_external": []
+}

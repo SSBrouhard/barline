@@ -16,7 +16,7 @@ jobs:
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -33,3 +33,16 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run CLI regression tests
         run: python -B -m unittest discover -s tests -v
+      - name: Build distributions
+        run: |
+          python -m pip install build twine
+          python -m build --outdir "$RUNNER_TEMP/barline-dist"
+          python -m twine check "$RUNNER_TEMP"/barline-dist/*
+      - name: Verify isolated wheel and sdist installations
+        run: |
+          for artifact in "$RUNNER_TEMP"/barline-dist/*; do
+            install_env=$(mktemp -d "$RUNNER_TEMP/barline-install.XXXXXX")
+            python -m venv "$install_env"
+            "$install_env/bin/python" -m pip install "$artifact"
+            python -B tests/smoke_distribution.py "$install_env/bin/python"
+          done

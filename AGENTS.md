@@ -1,11 +1,7 @@
-# T3 Code harness entry point
+# Working on Barline
 
-Read `AGENT.md` before working in this project. It is the session guide for the Lean harness.
+Read [AGENT.md](AGENT.md) for the session contract. One lead owns the ledger and integration. Keep ledgers, contracts, check logs and adapter contexts outside every target checkout. Follow the user's current authority and the target repository's instructions.
 
-The installed executable is `lean.py` in this directory. Invoke it with Python 3.10 or newer. Keep session ledgers, contracts and check logs outside this repository, in a separate session directory under the sibling `lean-sessions` folder. Use a distinct lead-owned ledger for each independent T3 conversation; delegated children follow their briefs and do not initialize separate ledgers. Continue an existing conversation with its existing ledger to preserve its history.
+Run `python3 -B -m unittest discover -s tests -v`. Packaging validation is documented in [docs/releasing.md](docs/releasing.md). Runtime requirements are Python 3.10+, Git and POSIX; build dependencies are separate.
 
-Use the harness for requested work: freeze the task contract, run named checks, assess actual behavior, and report the gate result. Read and retain the target repository's own instructions. The harness records exact-tree check evidence; it does not intercept every T3 tool call or measure model usage.
-
-For the local package check, the command is `python3 -m unittest discover -s tests -v`. The package has no third-party runtime dependencies.
-
-Do not push, publish, merge or change global agent instructions as part of setup. Never add an agent co-author to commits. Never use an em dash. Preserve the bundled original `AGENT.md` and Git history.
+Preserve historical ledgers and the original session guide at [examples/t3/AGENT.legacy.md](examples/t3/AGENT.legacy.md). Do not activate global hooks, publish, merge or change repository visibility without task authority. Never add an agent co-author trailer or use an em dash.

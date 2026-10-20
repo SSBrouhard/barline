@@ -1,0 +1,11 @@
+include LICENSE README.md AGENT.md AGENTS.md PRINCIPLES.md contract.example.json
+include lean.py recover.py hooks/stop.py
+recursive-include barline *.py
+recursive-include docs *.md
+recursive-include examples *.json *.md
+recursive-include hooks/examples *.json
+recursive-include tests *.py *.json *.md
+prune docs/plans
+prune outputs
+prune work
+global-exclude __pycache__ *.py[cod] .DS_Store
