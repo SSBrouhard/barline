@@ -189,7 +189,8 @@ def dispatch(request):
     # lock open inside source. Then re-read under its existing exclusive lock.
     initial = json.loads(path.read_bytes())
     validate_identity(request, initial)
-    observation = lean.observe(initial['state'], initial['task'], initial['repo'])
+    observe = lean.task_identity if operation == 'turn' else lean.observe
+    observation = observe(initial['state'], initial['task'], initial['repo'])
     outside(path, observation)
     outside(Path(str(path) + '.lock').resolve(), observation)
     with context_lock(path):
@@ -282,10 +283,29 @@ def handoff_command(binding):
                        '--binding', str(binding), '--reason', 'input', '--next', 'Describe the next authorized action'])
 
 
-def native_dispatch(request):
+def normalize_request(request):
+    # Keep parsing/normalization inside a supervised worker. Returning the event
+    # kind first lets the parent preserve user input even if evaluation stalls.
     event = json.loads(request['payload'])
+    normalized = normalize(event, request['client'])
+    return {'decision': 'normalized', 'normalized': normalized,
+            'event': {key: event[key] for key in ('backgroundTasks', 'sessionCrons') if key in event}}
+
+
+def prompt_unavailable(client, reason):
+    # Grok discards allowed prompt context. Never veto human recovery input.
+    if client == 'grok':
+        return {}
+    return {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext':
+            ('Lean prompt context unavailable: ' + str(reason)[:2000] +
+             '. Completion remains guarded. Recover the selected binding or retry the native prompt; '
+             'do not use a previous turn handoff or infer native IDs from text.')}}
+
+
+def native_dispatch(request):
+    event = request['event']
     client = request['client']
-    normalized = normalize(event, client)
+    normalized = request['normalized']
     if normalized is None:
         return {}
     name, identity, marker = normalized
@@ -296,8 +316,6 @@ def native_dispatch(request):
     result = dispatch(dict(identity, operation='turn' if name == 'UserPromptSubmit' else 'evaluate'))
     command = handoff_command(identity['binding'])
     if name == 'UserPromptSubmit':
-        if result['decision'] == 'block':
-            return result
         if client == 'grok':
             # Grok discards allowed UserPromptSubmit stdout/context.
             return {}
@@ -377,7 +395,7 @@ def main(argv=None):
     native = bool(argv and argv[0] == 'native')
     try:
         parser = SafeParser(description=__doc__)
-        parser.add_argument('operation', choices=('shared', '_evaluate', '_native', '_command', 'native', 'enroll', 'handoff'))
+        parser.add_argument('operation', choices=('shared', '_evaluate', '_normalize', '_native', '_command', 'native', 'enroll', 'handoff'))
         parser.add_argument('--timeout', type=float, default=5, help='Evaluator deadline, below native hook timeout')
         parser.add_argument('--client', choices=CLIENTS)
         parser.add_argument('--binding')
@@ -394,10 +412,21 @@ def main(argv=None):
             # Native examples use timeout=10, leaving five seconds of headroom.
             lean.require(args.timeout <= 5, 'Native evaluator deadline must be at most 5 seconds; configure native timeout 10 or greater')
             raw, remaining = read_bounded(args.timeout)
-            result = supervise({'payload': raw, 'client': args.client, 'binding': args.binding}, remaining, '_native')
-            output = result.get('output') if result.get('decision') == 'native' else result
-            lean.require(isinstance(output, dict), 'Invalid native response')
-            result = output
+            deadline = time.monotonic() + remaining
+            parsed = supervise({'payload': raw, 'client': args.client}, remaining, '_normalize')
+            if parsed.get('decision') != 'normalized':
+                result = parsed
+            else:
+                normalized = parsed['normalized']
+                result = supervise(dict(parsed, client=args.client, binding=args.binding),
+                                   max(.001, deadline - time.monotonic()), '_native')
+                output = result.get('output') if result.get('decision') == 'native' else None
+                if isinstance(output, dict):
+                    result = output
+                elif normalized is not None and normalized[0] == 'UserPromptSubmit':
+                    result = prompt_unavailable(args.client, result.get('reason', 'Invalid native response'))
+                else:
+                    result = blocked(result.get('reason', 'Invalid native response'))
         elif args.operation in ('enroll', 'handoff'):
             request = {'operation': 'enroll' if args.operation == 'enroll' else 'handoff-cli',
                        'binding': args.binding, 'client': args.client, 'session_id': args.session_id,
@@ -409,6 +438,8 @@ def main(argv=None):
             lean.require(len(raw.encode()) <= MAX_REQUEST, 'Completion request too large')
             if args.operation == 'shared':
                 result = supervise(raw, args.timeout)
+            elif args.operation == '_normalize':
+                result = normalize_request(json.loads(raw))
             elif args.operation == '_native':
                 result = {'decision': 'native', 'output': native_dispatch(json.loads(raw))}
             elif args.operation == '_command':

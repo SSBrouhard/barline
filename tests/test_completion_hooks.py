@@ -202,6 +202,46 @@ class CompletionTests(CompletionFixture):
         self.assertFalse((second / 'context.json').exists())
         self.assertFalse((second / 'context.json.lock').exists())
 
+    def test_turn_retains_task_schema_repository_and_checkout_boundaries(self):
+        self.enroll()
+        self.accepted()
+        original = self.state.read_bytes()
+        context = self.binding.read_bytes()
+        mutations = (
+            lambda state: state.update(version=1),
+            lambda state: state['tasks'].pop('one'),
+            lambda state: state['tasks']['one'].update(work_state='UNKNOWN'),
+            lambda state: state['tasks']['one'].update(repo=str(self.root)),
+            lambda state: state['tasks']['one']['evidence'][-1].update(status='UNKNOWN'),
+        )
+        for mutate in mutations:
+            data = json.loads(original)
+            mutate(data)
+            self.state.write_text(json.dumps(data))
+            before = self.preserved()
+            result = self.hook('turn')
+            self.assertEqual(result['decision'], 'block', result)
+            self.assertEqual(self.binding.read_bytes(), context)
+            self.assertEqual(self.preserved(), before)
+        self.state.write_bytes(original)
+        lock = Path(str(self.state) + '.lock')
+        lock.unlink()
+        self.assertEqual(self.hook('turn')['decision'], 'block')
+        self.assertFalse(lock.exists(), 'Turn validation created a ledger lock')
+        lock.touch()
+        second = self.root / 'second'
+        subprocess.run(['git', 'clone', '-q', str(self.repo), str(second)], check=True)
+        self.lean('start', '--task', 'two', '--repo', second, '--contract', self.contract)
+        moved = second / 'context.json'
+        moved.write_bytes(context)
+        moved_lock = Path(str(moved) + '.lock')
+        moved_lock.touch()
+        result = self.hook('turn', binding=str(moved))
+        self.assertEqual(result['decision'], 'block', result)
+        self.assertIn('outside every target checkout', result['reason'])
+        self.assertEqual(moved.read_bytes(), context)
+        self.assertEqual(moved_lock.read_bytes(), b'')
+
     def test_whole_process_deadline_kills_stalled_git_group(self):
         self.enroll()
         bindir = self.root / 'bin'
@@ -381,12 +421,12 @@ class NativeProtocolTests(CompletionFixture):
         payload.update(extra)
         return payload
 
-    def native(self, client, payload, binding=True, timeout=4):
+    def native(self, client, payload, binding=True, timeout=4, env=None):
         args = [sys.executable, '-B', str(HOOK), 'native', '--client', client, '--timeout', str(timeout)]
         if binding:
             args += ['--binding', str(self.binding)]
         raw = payload if isinstance(payload, str) else json.dumps(payload)
-        process = subprocess.run(args, input=raw, capture_output=True, text=True, timeout=timeout + 3)
+        process = subprocess.run(args, input=raw, capture_output=True, text=True, timeout=timeout + 3, env=env)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         self.assertEqual(process.stderr, '')
         result = json.loads(process.stdout)
@@ -397,6 +437,111 @@ class NativeProtocolTests(CompletionFixture):
     def enroll_native(self, client):
         self.enroll(client=client)
         return self.native(client, self.event(client, 'UserPromptSubmit'))
+
+    def assert_prompt_allowed(self, client, result, diagnostic=None):
+        self.assertNotEqual(result.get('decision'), 'block', result)
+        if client == 'grok':
+            self.assertEqual(result, {})
+        else:
+            context = result['hookSpecificOutput']['additionalContext']
+            self.assertEqual(result['hookSpecificOutput']['hookEventName'], 'UserPromptSubmit')
+            if diagnostic:
+                self.assertIn(diagnostic, context)
+                self.assertIn('Completion remains guarded', context)
+
+    def test_prompt_errors_allow_input_but_stop_stays_closed(self):
+        for client in ('claude', 'codex', 'grok'):
+            self.binding = self.root / (client + '.json')
+            self.enroll_native(client)
+            original = self.binding.read_bytes()
+            for broken in ('missing', 'corrupt', 'identity'):
+                with self.subTest(client=client, broken=broken):
+                    if broken == 'missing':
+                        self.binding.unlink()
+                    elif broken == 'corrupt':
+                        self.binding.write_text('{')
+                    else:
+                        data = json.loads(original)
+                        data['session_id'] = 'other-session'
+                        self.binding.write_text(json.dumps(data))
+                    try:
+                        result = self.native(client, self.event(client, 'UserPromptSubmit'))
+                        stop = self.native(client, self.event(client))
+                    finally:
+                        self.binding.write_bytes(original)
+                    self.assert_prompt_allowed(client, result, 'unavailable')
+                    self.assertEqual(stop['decision'], 'block')
+            for locked_path in (str(self.state) + '.lock', str(self.binding) + '.lock'):
+                with self.subTest(client=client, busy=locked_path):
+                    with open(locked_path, 'rb') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        result = self.native(client, self.event(client, 'UserPromptSubmit'))
+                        self.assert_prompt_allowed(client, result, 'busy')
+                        self.assertEqual(self.native(client, self.event(client))['decision'], 'block')
+
+    def test_failed_new_prompt_cannot_reuse_previous_handoff(self):
+        for client in ('claude', 'codex', 'grok'):
+            self.binding = self.root / (client + '.json')
+            self.enroll_native(client)
+            self.assertEqual(self.hook('handoff', client=client, reason='input', next='Ask owner')['decision'], 'handoff-recorded')
+            turn_key = {'claude': 'prompt_id', 'codex': 'turn_id', 'grok': 'promptId'}[client]
+            prompt = self.event(client, 'UserPromptSubmit', **{turn_key: 'new-human-turn'})
+            with open(str(self.state) + '.lock', 'rb') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assert_prompt_allowed(client, self.native(client, prompt), 'busy')
+            self.assertEqual(self.native(client, self.event(client, **{turn_key: 'new-human-turn'}))['decision'], 'block')
+            self.assertEqual(self.native(client, self.event(client, **{turn_key: None}))['decision'], 'block')
+            # A successful delivery records the new identity and drops the old
+            # handoff; duplicate deliveries of the same identity stay harmless.
+            self.assert_prompt_allowed(client, self.native(client, prompt))
+            self.assertIsNone(json.loads(self.binding.read_bytes())['handoff'])
+
+    def test_prompt_worker_deadline_allows_input_without_stale_handoff(self):
+        for client in ('claude', 'codex', 'grok'):
+            self.binding = self.root / (client + '.json')
+            self.enroll_native(client)
+            self.hook('handoff', client=client, reason='input', next='Ask owner')
+            original = self.binding.read_bytes()
+            self.binding.unlink()
+            os.mkfifo(self.binding)
+            turn_key = {'claude': 'prompt_id', 'codex': 'turn_id', 'grok': 'promptId'}[client]
+            try:
+                start = time.monotonic()
+                result = self.native(client, self.event(client, 'UserPromptSubmit', **{turn_key: 'new-human-turn'}), timeout=.4)
+                self.assertLess(time.monotonic() - start, 2)
+                self.assert_prompt_allowed(client, result, 'deadline')
+                stop = self.native(client, self.event(client, **{turn_key: 'new-human-turn'}), timeout=.4)
+                self.assertEqual(stop['decision'], 'block', stop)
+                self.assertIn('deadline', stop['reason'])
+            finally:
+                self.binding.unlink()
+                self.binding.write_bytes(original)
+            self.assertEqual(self.native(client, self.event(client, **{turn_key: 'new-human-turn'}))['decision'], 'block')
+
+    def test_prompt_turn_does_not_invoke_git_or_hash_checkout(self):
+        self.enroll_native('codex')
+        payload = self.repo / 'large'
+        payload.write_bytes(b'x' * (2 * 1024 * 1024))
+        for index in range(128):
+            os.link(payload, self.repo / ('large-' + str(index)))
+        bindir = self.root / 'prompt-bin'
+        bindir.mkdir()
+        invoked = self.root / 'git-invoked'
+        shim = bindir / 'git'
+        shim.write_text('#!' + sys.executable + '\nimport pathlib,time\n' +
+                        'pathlib.Path(' + repr(str(invoked)) + ').touch()\ntime.sleep(30)\n')
+        shim.chmod(0o755)
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
+        before = self.preserved()
+        result = self.native('codex', self.event('codex', 'UserPromptSubmit', turn_id='new-turn'), timeout=.8, env=env)
+        self.assert_prompt_allowed('codex', result)
+        self.assertFalse(invoked.exists(), 'Prompt identity recording invoked Git')
+        self.assertEqual(json.loads(self.binding.read_bytes())['turn_id'], 'new-turn')
+        self.assertEqual(self.preserved(), before)
+        stop = self.native('codex', self.event('codex', turn_id='new-turn'), timeout=.4, env=env)
+        self.assertEqual(stop['decision'], 'block')
+        self.assertIn('deadline', stop['reason'])
+        self.assertTrue(invoked.exists(), 'Stop skipped full observation')
 
     def test_native_protocol_complete_block_handoff_and_nonapplicable(self):
         for client in ('claude', 'codex', 'grok'):

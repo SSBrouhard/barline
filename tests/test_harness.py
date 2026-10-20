@@ -713,6 +713,27 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(self.gate(code=0)["validation"], "PASS")
         self.assertEqual(json.loads(self.state.read_text())["tasks"]["one"]["contract"], task["contract"])
 
+    def test_generated_recovery_immediately_enrolls_read_only_completion_guard(self):
+        self.setup_task()
+        self.run_check()
+        self.assess()
+        archive = self.root / "completion-recovery.tgz"
+        self.call("checkpoint", "--task", "one", "--output", archive,
+                  "--next", "Continue after recovery")
+        restored = self.root / "completion-recovery"
+        self.run_generated_recovery(archive, restored)
+        state = restored / "state.json"
+        before = state.read_bytes()
+        result = subprocess.run([
+            sys.executable, "-B", str(CLI.parent / "hooks/stop.py"), "enroll",
+            "--client", "codex", "--session-id", "recovered-native-session",
+            "--repo", str(restored / "repo"), "--state", str(state),
+            "--task", "one", "--binding", str(self.root / "recovered-binding.json"),
+        ], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "enrolled")
+        self.assertEqual(state.read_bytes(), before)
+
     def run_generated_recovery(self, archive, destination, relocated=None, code=0):
         with tarfile.open(archive) as tar:
             resume = tar.extractfile("resume.md").read().decode()

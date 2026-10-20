@@ -30,6 +30,8 @@ Only the latest attempt for each check can qualify, and it must PASS on the curr
 
 `assess` is the lead's recorded acceptance judgment, separate from command evidence. A PASS says every configured local check passed on this tree and the lead marked its bar met. It does not certify arbitrary semantics, independent review or a deployed system. Work state (ACTIVE/PAUSED), scope and validation (PASS/FAIL/BLOCKED/INCONCLUSIVE) stay separate.
 
+Optional [completion hooks](docs/completion-hooks.md) reuse a read-only gate observation and distinguish acceptance from explicit non-completion handoffs. Claude Code, Codex CLI and Grok CLI adapters have deterministic process coverage and version-specific native smoke evidence. Native failures and continuation caps can still let a client stop while Lean remains nonpassing. See the guide's validation status before opting in. Adding the examples does not activate them.
+
 ### Follow-ups and frozen contracts
 
 The lead compares each follow-up against the current contract. Clarifications that leave acceptance criteria, exclusions and authorized actions unchanged continue the same task without another contract or approval. Material changes require a new frozen task in the existing ledger. Put the actual follow-up authorization reference in the new contract's `owner_request`; an already-authorized user request needs no additional approval.

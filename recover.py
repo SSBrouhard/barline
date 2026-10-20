@@ -168,6 +168,8 @@ def restore(archive, destination, task_id):
             for name in ("state.json", "resume.md", "log-manifest.json"):
                 if name in entries:
                     extract_member(tar, entries[name], destination / ("archived-" + name))
+            # Explicit recovery creates the lock that read-only observers require.
+            (destination / "state.json.lock").touch(exist_ok=False)
             save(destination / "state.json", recovered)
             return {"state": str(destination / "state.json"), "repo": str(repo),
                     "fingerprint": saved["fingerprint"], "archive_sha256": digest,

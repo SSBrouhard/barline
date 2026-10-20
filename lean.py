@@ -184,8 +184,9 @@ def gate(t, now=None):
             "assurance": "Local checks are executed. Scope and external verification are lead-recorded claims; external sources are not fetched by this CLI."}
 
 
-def observe(state, task, repo=None):
-    """No-write observation. Call in a deadline-supervised process for hook use."""
+@contextlib.contextmanager
+def observation_task(state, task, repo=None):
+    """Validate exact task identity under its existing read-only ledger lock."""
     path = Path(state).resolve()
     # No mkdir, append-open or save: absence of the existing lock is unavailable.
     with open(str(path) + ".lock", "rb") as lock:
@@ -222,6 +223,19 @@ def observe(state, task, repo=None):
         repos = [str(Path(value["repo"]).resolve()) for value in s["tasks"].values()]
         require(not any(path.is_relative_to(Path(root)) for root in repos),
                 "Ledger must be outside every target checkout")
+        require(target.is_dir(), "Enrolled checkout is unavailable")
+        yield path, raw, t, target, repos
+
+
+def task_identity(state, task, repo):
+    """No-write turn validation; no Git, source traversal or acceptance claim."""
+    with observation_task(state, task, repo) as (path, raw, t, target, repos):
+        return {"task": task, "repo": str(target), "state": str(path), "repos": repos}
+
+
+def observe(state, task, repo=None):
+    """No-write observation. Call in a deadline-supervised process for hook use."""
+    with observation_task(state, task, repo) as (path, raw, t, target, repos):
         before = snapshot(target, readonly=True)
         result = gate(t, now=before)
         pause_valid = False
