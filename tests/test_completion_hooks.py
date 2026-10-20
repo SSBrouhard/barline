@@ -664,6 +664,30 @@ class NativeProtocolTests(CompletionFixture):
         self.assertEqual(json.loads(result.stdout)['decision'],'block')
         self.assertIn('deadline',json.loads(result.stdout)['reason'].lower())
 
+    def test_native_timeout_keeps_deadline_after_group_kill(self):
+        self.enroll_native('codex')
+        bindir = self.root / 'timeout-bin'
+        bindir.mkdir()
+        shim = bindir / 'git'
+        shim.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(30)\n')
+        shim.chmod(0o755)
+        # Model a platform rejecting a second signal after a successful group kill.
+        injection = self.root / 'signal-boundary'
+        injection.mkdir()
+        (injection / 'sitecustomize.py').write_text(
+            'import os\noriginal = os.killpg\nkilled = set()\n'
+            'def killpg(pid, sig):\n'
+            '    if pid in killed: raise PermissionError(1, "Operation not permitted")\n'
+            '    result = original(pid, sig)\n'
+            '    killed.add(pid)\n'
+            '    return result\n'
+            'os.killpg = killpg\n')
+        env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'],
+                   PYTHONPATH=str(injection))
+        result = self.native('codex', self.event('codex'), timeout=1, env=env)
+        self.assertEqual(result['decision'], 'block')
+        self.assertIn('deadline', result['reason'].lower())
+
     def test_native_enrollment_cli_and_duplicate_delivery(self):
         result=subprocess.run([sys.executable,'-B',str(HOOK),'enroll','--client','codex','--session-id','session-one',
                                '--binding',str(self.binding),'--repo',str(self.repo),'--state',str(self.state),'--task','one'],

@@ -39,6 +39,7 @@ def supervise(request, timeout=5, worker='_evaluate'):
     if len(payload.encode()) > MAX_REQUEST:
         return blocked('Completion request too large')
     process = None
+    group_killed = False
     try:
         process = subprocess.Popen([sys.executable, '-B', str(Path(__file__).resolve()), worker],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -47,6 +48,7 @@ def supervise(request, timeout=5, worker='_evaluate'):
             stdout, stderr = process.communicate(payload, timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
+            group_killed = True
             # A misbehaving executable may have detached a descendant retaining
             # a pipe. Cleanup must not consume the response serialization budget.
             try:
@@ -69,10 +71,11 @@ def supervise(request, timeout=5, worker='_evaluate'):
         # The evaluator owns this group. Clean any descendant retaining a pipe or
         # outliving its parent, including on interruption of the hook process.
         if process is not None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if not group_killed:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             process.wait()
 
 
