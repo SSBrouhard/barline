@@ -48,38 +48,42 @@ def require(condition, message):
         raise Denied(message)
 
 
-def git(repo, *args):
-    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+def git(repo, *args, readonly=False):
+    # Observation must not perform Git's optional index refresh or take its locks.
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0") if readonly else None
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env)
     require(p.returncode == 0, p.stderr.decode(errors="replace").strip() or "Git failed")
     return p.stdout
 
 
-def snapshot(repo):
+def snapshot(repo, readonly=False):
     repo = Path(repo).resolve()
-    require(git(repo, "rev-parse", "--show-toplevel").decode().strip() == str(repo),
+    def read_git(*args):
+        return git(repo, *args, readonly=readonly)
+    require(read_git("rev-parse", "--show-toplevel").decode().strip() == str(repo),
             "Use the repository root")
-    head = git(repo, "rev-parse", "HEAD").decode().strip()
-    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").decode().strip()
-    names = sorted(set(git(repo, "ls-files", "-z", "--cached", "--others",
+    head = read_git("rev-parse", "HEAD").decode().strip()
+    branch = read_git("rev-parse", "--abbrev-ref", "HEAD").decode().strip()
+    names = sorted(set(read_git("ls-files", "-z", "--cached", "--others",
                            "--exclude-standard").split(b"\0")) - {b""})
     h = hashlib.sha256((head + "\0" + branch).encode())
     for raw in names:
         path = repo / os.fsdecode(raw)
         h.update(len(raw).to_bytes(8, "big") + raw)
         if path.is_symlink():
-            data = os.fsencode(os.readlink(path))
+            digest = hashlib.sha256(os.fsencode(os.readlink(path))).digest()
             mode = "link"
         elif path.is_file():
-            data = path.read_bytes()
+            digest = bytes.fromhex(file_sha256(path))
             mode = str(path.stat().st_mode & 0o777)
         elif not path.exists():
-            data, mode = b"", "deleted"
+            digest, mode = hashlib.sha256(b"").digest(), "deleted"
         else:
             raise Denied("Submodules/special files need a repository-specific checkpoint adapter")
-        h.update(mode.encode() + b"\0" + hashlib.sha256(data).digest())
-    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all").decode(errors="replace")
+        h.update(mode.encode() + b"\0" + digest)
+    status = read_git("status", "--porcelain=v1", "--untracked-files=all").decode(errors="replace")
     # Include index changes too, even when worktree contents are identical.
-    h.update(git(repo, "diff", "--cached", "--binary", "HEAD"))
+    h.update(read_git("diff", "--cached", "--binary", "HEAD"))
     return {"head": head, "branch": branch, "fingerprint": h.hexdigest(), "dirty": bool(status),
             "status": status, "files": [os.fsdecode(x) for x in names]}
 
@@ -140,8 +144,8 @@ def contract(c):
     return c
 
 
-def gate(t):
-    now = snapshot(t["repo"])
+def gate(t, now=None):
+    now = snapshot(t["repo"]) if now is None else now
     # A newer attempt supersedes the old one even if its source no longer matches.
     attempts = {e["check"]: e for e in t["evidence"]}
     latest = {name: e for name, e in attempts.items() if e["fingerprint"] == now["fingerprint"]}
@@ -178,6 +182,67 @@ def gate(t):
             "contract_conflicts": t.get("contract_conflicts", []),
             "external_receipts": t["external"],
             "assurance": "Local checks are executed. Scope and external verification are lead-recorded claims; external sources are not fetched by this CLI."}
+
+
+def observe(state, task, repo=None):
+    """No-write observation. Call in a deadline-supervised process for hook use."""
+    path = Path(state).resolve()
+    # No mkdir, append-open or save: absence of the existing lock is unavailable.
+    with open(str(path) + ".lock", "rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Denied("Lead ledger is busy; retry observation after its atomic action")
+        raw = path.read_bytes()
+        s = json.loads(raw)
+        require(type(s) is dict and type(s.get("version")) is int and s["version"] == 2,
+                "Unsupported ledger version; preserve it unchanged")
+        require(type(s.get("tasks")) is dict and task in s["tasks"], "Exact enrolled task is missing")
+        t = s["tasks"][task]
+        require(type(t) is dict, "Invalid task record")
+        contract(t["contract"])
+        require(t["work_state"] in ("ACTIVE", "PAUSED") and
+                t["scope_outcome"] in ("unknown", "not-met", "met") and
+                type(t["failed_hypotheses"]) is int and t["failed_hypotheses"] >= 0,
+                "Invalid task state")
+        require(type(t["evidence"]) is list and type(t["external"]) is list, "Invalid evidence records")
+        require(type(t.get("contract_conflicts", [])) is list and
+                ("superseded_by" not in t or isinstance(t["superseded_by"], str) and bool(t["superseded_by"])),
+                "Invalid task conflict or successor record")
+        for evidence in t["evidence"]:
+            require(evidence["check"] in t["contract"]["checks"] and
+                    evidence["status"] in ("PASS", "FAIL", "BLOCKED", "INCONCLUSIVE") and
+                    isinstance(evidence["fingerprint"], str), "Invalid check evidence")
+        for receipt in t["external"]:
+            require(receipt["kind"] in t["contract"]["required_external"] and
+                    receipt["result"] in ("PASS", "FAIL", "BLOCKED", "INCONCLUSIVE"),
+                    "Invalid external receipt")
+        target = Path(t["repo"]).resolve()
+        require(repo is None or target == Path(repo).resolve(), "Enrolled checkout differs from task")
+        repos = [str(Path(value["repo"]).resolve()) for value in s["tasks"].values()]
+        require(not any(path.is_relative_to(Path(root)) for root in repos),
+                "Ledger must be outside every target checkout")
+        before = snapshot(target, readonly=True)
+        result = gate(t, now=before)
+        pause_valid = False
+        if t["work_state"] == "PAUSED":
+            cp = t.get("checkpoint", {})
+            try:
+                pause_valid = bool(t.get("next", "").strip() and
+                    t.get("checkpoint_snapshot", {}).get("fingerprint") == before["fingerprint"] and
+                    cp.get("sha256") and file_sha256(cp["path"]) == cp["sha256"])
+            except OSError:
+                # A broken archive prevents certifying pause, but the lead may
+                # still need a truthful input/blocker handoff about its recovery.
+                pause_valid = False
+        after = snapshot(target, readonly=True)
+        require(before == after and path.read_bytes() == raw,
+                "Repository or ledger changed during observation; retry without starting duplicate checks")
+        result.update(task=task, repo=str(target), state=str(path), repos=repos,
+                      ledger_digest=hashlib.sha256(raw).hexdigest(),
+                      failed_hypotheses=t["failed_hypotheses"], pause_valid=pause_valid,
+                      next=t.get("next"))
+        return result
 
 
 def execute(s, t, name, state_path):
@@ -363,6 +428,9 @@ def parser():
     p.add_argument("--state", required=True, type=Path, help="One lead-owned session ledger OUTSIDE target repositories")
     sp = p.add_subparsers(dest="command", required=True)
     sp.add_parser("init")
+    observation = sp.add_parser("observe", help="Supervised read-only gate query; never saves the ledger")
+    observation.add_argument("--task", required=True)
+    observation.add_argument("--timeout", type=float, default=5)
     start = sp.add_parser("start")
     start.add_argument("--repo", required=True, type=Path)
     start.add_argument("--contract", required=True, type=Path)
@@ -396,6 +464,13 @@ def parser():
 
 def main(argv=None):
     a = parser().parse_args(argv)
+    if a.command == "observe":
+        # Keep all traversal, JSON loading and Git work inside the bounded worker.
+        sys.dont_write_bytecode = True
+        from hooks.stop import supervise
+        result = supervise({"operation": "observe", "state": str(a.state), "task": a.task}, a.timeout)
+        print(json.dumps(result, indent=2))
+        return 2 if result.get("decision") == "block" else 0
     try:
         with locked(a.state) as path:
             if a.command == "init":
