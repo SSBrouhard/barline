@@ -65,3 +65,60 @@ Context operations use an existing exclusive nonblocking lock and atomic replace
 | Two failed hypotheses | `block` | Stop repairs; checkpoint for diagnosis with new causal evidence or record a handoff |
 
 The core cannot authenticate lead-recorded acceptance, external verification or handoff reasons. Optional client hooks can also be skipped or defeated by native trust settings, timeouts, crashes and continuation caps. A forced native stop never changes Lean evidence or becomes a PASS. Fixture tests establish the shared boundary only; they do not prove a native client loaded or enforced a hook.
+
+## Native command adapters
+
+`hooks/stop.py native --client claude|codex|grok [--binding /external/context.json] --timeout 5` reads one native event from stdin and prints only native response JSON, with exit 0. The adapter translates complete, valid pause, explicit handoff and not-applicable into `{}`. It translates nonpass, unavailable evidence, malformed input, identity mismatch, timeout and configuration errors into `{"decision":"block","reason":"..."}`. It never emits `continue: false`, which can override other native blocking hooks. Its evaluator budget includes pipe ingestion, JSON parsing, identity normalization, binding reads, observation and diagnostic context writes. Native registration must allow at least 10 seconds, leaving startup/cleanup/response headroom around the 5-second evaluator deadline.
+
+An omitted binding means the optional guard is not enrolled. An explicitly configured binding must exist and match. No latest-session discovery or automatic enrollment occurs. Native event kind and known child/fork metadata are checked before binding reads, including Codex children that share their parent's `session_id`. Unknown or malformed identity metadata blocks rather than selecting the parent. Child events, teardown, interruption and API-failure events return `{}` as irrelevant, never a completion receipt. Grok Stop is applicable only for `reason: end_turn`; shutdown and channel closure cannot keep a native turn alive.
+
+The identity fields are Claude `session_id`/`prompt_id`, Codex `session_id`/`turn_id`, and Grok `sessionId`/`promptId`. Grok supports its camelCase `hookEventName` with snake_case values and its compatibility `hook_event_name` with PascalCase values; contradictory names block. The Claude and Codex adapters reject Grok envelopes, so loading the wrong compatibility registration cannot silently report acceptance. This is a workflow guard, not an authenticated security boundary. Named custom agents, children and forks with child metadata are deliberately excluded from lead enrollment.
+
+### Explicit enrollment
+
+Choose the exact task and the native lead session's identity from authoritative native session evidence. Create the external parent directory first, then enroll explicitly:
+
+```sh
+python3 -B /absolute/path/to/lean-harness/hooks/stop.py enroll \
+  --client codex --session-id ACTUAL_NATIVE_SESSION_ID \
+  --repo /absolute/target-checkout --state /external/session.json \
+  --task exact-task --binding /external/codex-binding.json
+```
+
+Use a different external binding for every client/conversation/task. Enrollment will not overwrite an existing binding. It observes the named task and writes only the context and its lock. Enrollment does not run a check or assert acceptance. The command prints shared JSON and exits 2 on error; it is an explicit setup command, not the native hook entry point.
+
+### Current-turn handoffs
+
+Register both `UserPromptSubmit` and `Stop`. The prompt event captures the native current turn. Missing turn identity clears any older handoff and disables creating a handoff until a supported native prompt arrives; it never extracts an ID from prompt prose or a transcript. Claude and Codex receive a ready-to-run handoff command in `hookSpecificOutput.additionalContext`. Grok currently discards allowed `UserPromptSubmit` stdout and context, so its guide and Stop rejection feedback supply that command instead. Grok still captures native turn identity internally.
+
+For a legitimate input request, progress update or external blocker, use the explicit command before ending the turn:
+
+```sh
+python3 -B /absolute/path/to/lean-harness/hooks/stop.py handoff \
+  --binding /external/codex-binding.json \
+  --reason input --next 'Ask the owner for the missing decision'
+```
+
+`--reason` accepts `progress`, `input` or `external-blocker`. The command reads the identity and current turn directly from the chosen binding; agents do not copy IDs out of model text. It records a non-completion handoff bound to that turn, fingerprint and ledger digest. This does not grant permission for any additional work, change the task's acceptance, or create a PASS. New native prompts clear the old handoff. Source or ledger changes invalidate it. If the binding is broken, recover the explicit configuration before recording a handoff; do not bypass the guard by inventing identity.
+
+Repeated unchanged rejection returns stable diagnosis/handoff feedback. Minimal rejection history lives only in the external context and compares the observed fingerprint, ledger digest and blocking reason. A changed tree with the same missing-check reason is not called an unchanged rejection. Documented `stop_hook_active` (or Grok `stopHookActive`) markers retain this history across synthetic continuations, including Codex's new continuation turns; prompt wording is never used. Duplicate delivery is idempotent. A marker never allows completion, records a handoff or resumes repairs automatically. The hook cannot force endless continuation: client cancellation, native caps and failures remain possible, with acceptance unchanged.
+
+Grok's `backgroundTasks` and `sessionCrons` arrays must both be present and empty before the adapter permits a `complete` decision. Missing arrays are unknown, not empty. Account for pending work or scheduled wakeups through a valid pause or explicit non-completion handoff. That handoff preserves the distinction between waiting and accepted completion.
+
+### Optional registration examples
+
+The files under `hooks/examples/` are inactive examples with placeholder absolute paths:
+
+- `claude.json` uses `--client claude` and a Claude-specific external binding.
+- `codex.json` uses `--client codex` and a separate Codex binding.
+- `grok.json` uses `--client grok` and a separate Grok binding.
+
+Each example registers synchronous `UserPromptSubmit` and `Stop` command hooks with native timeout 10 seconds and evaluator timeout 5 seconds. Replace paths and explicitly enroll the intended session before opting in. Select only the example for the client you intend to run; do not install all examples into shared settings. Review existing hook registrations and use exactly one registration per event for this guard. Duplicated deliveries are harmless to acceptance but can contend on the context lock and block with a retry diagnostic.
+
+Grok scans Claude-compatible hook sources by default. If using the Grok example, separately review the user's Grok compatibility configuration and disable Claude hook scanning with `[compat.claude] hooks = false` in the appropriate Grok TOML layer. Do not automatically edit user configuration or trust settings. If Claude-compatible sources remain active, a Claude adapter receiving a Grok event blocks and identifies the mismatch. Registering this guard through multiple native and compatibility sources can produce duplicate feedback. Keep each integration isolated and inspect the client's actual hook inventory before any native support claim.
+
+### Verification boundary
+
+Process fixtures in `tests/fixtures/hooks/` are source-derived examples, not native captures. They verify stdin/stdout/exit translation, read-only target observation, malformed and missing context, child filtering, native identities, handoffs, repeated rejection and deadline behavior. They cannot establish that a particular installed client loads, trusts or enforces its hooks. Native support must be recorded separately with the exact version, launch mode, isolated configuration and observed outcomes. No client configuration is activated by these examples. T3-mediated paths are unverified.
+
+The protocol sources consulted for this adapter implementation are the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks#stop), and [Grok CLI hooks guide](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md). Native timeout/crash/malformed-output behavior can fail open, particularly in Grok. A client stopping despite a guard failure is a protection limit, never evidence that Lean passed.

@@ -1,0 +1,1 @@
+These are source-derived protocol examples from the official client hook documentation consulted on 2026-10-20. They are not captures from running native clients. Tests substitute $REPO with a disposable checkout. Native support requires separate observed client evidence.

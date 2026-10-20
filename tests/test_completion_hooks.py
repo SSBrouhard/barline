@@ -14,7 +14,7 @@ CLI = ROOT / 'lean.py'
 HOOK = ROOT / 'hooks' / 'stop.py'
 
 
-class CompletionTests(unittest.TestCase):
+class CompletionFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -88,6 +88,9 @@ class CompletionTests(unittest.TestCase):
                 contents[str(path)] = physical[key]
         return contents
 
+
+
+class CompletionTests(CompletionFixture):
     def test_absent_generic_is_not_applicable_but_missing_enrollment_blocks(self):
         self.assertEqual(self.hook(binding=None)['decision'], 'not-applicable')
         before = self.preserved()
@@ -365,6 +368,189 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertEqual(json.loads(p.stdout)['decision'], 'block')
         self.assertEqual(self.preserved(), before)
+
+
+class NativeProtocolTests(CompletionFixture):
+    # Process fixtures exercise protocol translation, not actual native loading.
+    def event(self, client, event='Stop', **extra):
+        payload = json.loads((ROOT / 'tests/fixtures/hooks' / (client + '-stop.json')).read_text())
+        payload['cwd'] = str(self.repo)
+        payload['hook_event_name'] = event
+        if client == 'grok':
+            payload['hookEventName'] = ''.join(('_' + char.lower()) if char.isupper() else char for char in event).lstrip('_')
+        payload.update(extra)
+        return payload
+
+    def native(self, client, payload, binding=True, timeout=4):
+        args = [sys.executable, '-B', str(HOOK), 'native', '--client', client, '--timeout', str(timeout)]
+        if binding:
+            args += ['--binding', str(self.binding)]
+        raw = payload if isinstance(payload, str) else json.dumps(payload)
+        process = subprocess.run(args, input=raw, capture_output=True, text=True, timeout=timeout + 3)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(process.stderr, '')
+        result = json.loads(process.stdout)
+        self.assertIsInstance(result, dict)
+        self.assertNotIn('continue', result)
+        return result
+
+    def enroll_native(self, client):
+        self.enroll(client=client)
+        return self.native(client, self.event(client, 'UserPromptSubmit'))
+
+    def test_native_protocol_complete_block_handoff_and_nonapplicable(self):
+        for client in ('claude', 'codex', 'grok'):
+            with self.subTest(client=client):
+                self.binding = self.root / (client + '.json')
+                result = self.enroll_native(client)
+                self.assertNotEqual(result.get('decision'), 'block', result)
+                if client != 'grok':
+                    self.assertIn('handoff', result['hookSpecificOutput']['additionalContext'])
+                else:
+                    self.assertEqual(result, {})
+                payload = self.event(client)
+                before = self.preserved()
+                result = self.native(client, payload)
+                self.assertEqual(result['decision'], 'block')
+                self.assertIn('handoff', result['reason'])
+                self.assertEqual(result, self.native(client, payload))
+                self.assertEqual(before, self.preserved())
+                self.assertEqual(self.native(client, payload, binding=False), {})
+                self.assertEqual(self.hook('handoff', client=client, reason='input', next='Ask owner')['decision'], 'handoff-recorded')
+                self.assertEqual(self.native(client, payload), {})
+                self.assertEqual(json.loads(self.state.read_text())['tasks']['one']['scope_outcome'], 'unknown')
+        self.accepted()
+        for client in ('claude', 'codex', 'grok'):
+            self.binding = self.root / (client + '.json')
+            self.assertEqual(self.native(client, self.event(client)), {})
+
+    def test_native_errors_are_valid_block_json(self):
+        for client in ('claude', 'codex', 'grok'):
+            for payload in ('{', '[]', '{}', self.event(client), self.event(client, cwd=None)):
+                with self.subTest(client=client, payload=payload):
+                    self.assertEqual(self.native(client, payload)['decision'], 'block')
+
+    def test_irrelevant_child_and_teardown_before_missing_binding(self):
+        for client in ('claude', 'codex', 'grok'):
+            for event in ('SubagentStop', 'SessionEnd', 'Interrupt', 'StopFailure', 'StopCancelled'):
+                self.assertEqual(self.native(client, self.event(client, event)), {})
+            child = {'subagentType': 'worker'} if client == 'grok' else {'agent_id': 'child'}
+            self.assertEqual(self.native(client, self.event(client, **child)), {})
+        for reason in ('channel_closed', 'shutdown'):
+            self.assertEqual(self.native('grok', self.event('grok', reason=reason)), {})
+
+    def test_wrong_adapter_unknown_metadata_and_missing_identity_block(self):
+        self.enroll_native('claude')
+        for payload in (self.event('grok'), self.event('claude', agent_id=[]),
+                        self.event('claude', session_id=''), self.event('claude', stop_hook_active='yes')):
+            self.assertEqual(self.native('claude', payload)['decision'], 'block')
+        self.binding = self.root / 'codex.json'
+        self.enroll_native('codex')
+        self.assertEqual(self.native('codex', self.event('codex', session_id='fork'))['decision'], 'block')
+        self.assertEqual(self.native('codex', self.event('codex', turn_id=None))['decision'], 'block')
+
+    def test_grok_unknown_background_never_means_empty(self):
+        self.enroll_native('grok')
+        self.accepted()
+        for field in ('backgroundTasks', 'sessionCrons'):
+            for value in (None, {}, [{'id': 'task', 'type': 'shell', 'status': 'running'}]):
+                self.assertEqual(self.native('grok', self.event('grok', **{field: value}))['decision'], 'block')
+            payload=self.event('grok'); del payload[field]
+            self.assertEqual(self.native('grok', payload)['decision'], 'block')
+
+    def test_codex_synthetic_turns_preserve_rejection_not_handoff(self):
+        self.enroll_native('codex')
+        first=self.native('codex', self.event('codex'))
+        rejection=json.loads(self.binding.read_text())['rejection']
+        self.native('codex', self.event('codex', 'UserPromptSubmit', turn_id='synthetic'))
+        second=self.native('codex', self.event('codex', turn_id='synthetic', stop_hook_active=True))
+        self.assertIn('Unchanged rejection', second['reason'])
+        self.assertNotIn('Unchanged rejection', first['reason'])
+        self.assertEqual(second, self.native('codex', self.event('codex', turn_id='synthetic', stop_hook_active=True)))
+        self.assertEqual(json.loads(self.binding.read_text())['rejection']['signature'], rejection['signature'])
+        self.assertEqual(self.hook('handoff', reason='progress', next='Continue later')['decision'], 'handoff-recorded')
+        self.assertEqual(self.native('codex', self.event('codex', turn_id='synthetic', stop_hook_active=True)), {})
+        self.native('codex', self.event('codex', 'UserPromptSubmit', turn_id='real-next'))
+        self.assertEqual(self.native('codex', self.event('codex', turn_id='real-next'))['decision'], 'block')
+
+    def test_native_cli_handoff_uses_binding_identity(self):
+        self.enroll_native('codex')
+        process=subprocess.run([sys.executable, '-B', str(HOOK), 'handoff', '--binding', str(self.binding),
+                                '--reason', 'input', '--next', 'Ask owner'], capture_output=True,text=True)
+        self.assertEqual(process.returncode,0,process.stdout+process.stderr)
+        self.assertEqual(json.loads(process.stdout)['decision'],'handoff-recorded')
+        self.assertEqual(self.native('codex',self.event('codex')), {})
+
+
+    def test_native_pause_is_allow_without_ledger_mutation(self):
+        self.accepted()
+        archive=self.root / 'pause.tgz'
+        self.lean('checkpoint', '--task', 'one', '--output', archive, '--next', 'Resume later')
+        for client in ('claude','codex','grok'):
+            self.binding=self.root / (client+'.json')
+            self.enroll_native(client)
+            before=self.preserved()
+            self.assertEqual(self.native(client,self.event(client)), {})
+            self.assertEqual(before,self.preserved())
+
+    def test_native_input_deadline_and_worker_deadline_block(self):
+        process=subprocess.Popen([sys.executable,'-B',str(HOOK),'native','--client','codex','--timeout','.2'],
+                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        # Keep stdin open: ingestion itself must fit in the evaluator budget.
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        start=time.monotonic()
+        process.wait(timeout=2)
+        self.assertLess(time.monotonic()-start,2)
+        self.assertEqual(process.returncode,0)
+        self.assertEqual(json.loads(process.stdout.read())['decision'],'block')
+        process.stdin.close(); process.stdout.close(); process.stderr.close()
+        self.enroll_native('codex')
+        bindir=self.root/'slow-bin'; bindir.mkdir()
+        shim=bindir/'git'
+        shim.write_text('#!'+sys.executable+'\nimport time\ntime.sleep(30)\n')
+        shim.chmod(0o755)
+        env=dict(os.environ,PATH=str(bindir)+os.pathsep+os.environ['PATH'])
+        start=time.monotonic()
+        result=subprocess.run([sys.executable,'-B',str(HOOK),'native','--client','codex','--binding',str(self.binding),'--timeout','.3'],
+                              input=json.dumps(self.event('codex')),capture_output=True,text=True,env=env,timeout=2)
+        self.assertLess(time.monotonic()-start,2)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['decision'],'block')
+        self.assertIn('deadline',json.loads(result.stdout)['reason'].lower())
+
+    def test_native_enrollment_cli_and_duplicate_delivery(self):
+        result=subprocess.run([sys.executable,'-B',str(HOOK),'enroll','--client','codex','--session-id','session-one',
+                               '--binding',str(self.binding),'--repo',str(self.repo),'--state',str(self.state),'--task','one'],
+                              capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout)['decision'],'enrolled')
+        self.native('codex',self.event('codex','UserPromptSubmit'))
+        result=self.native('codex',self.event('codex'))
+        before=self.binding.read_bytes()
+        self.assertEqual(self.native('codex',self.event('codex')),result)
+        self.assertEqual(self.binding.read_bytes(),before)
+        self.binding.write_text('{')
+        self.assertEqual(self.native('codex',self.event('codex'))['decision'],'block')
+
+    def test_native_grok_aliases_and_wrong_registration(self):
+        self.enroll_native('grok')
+        self.accepted()
+        for removed in ('hookEventName','hook_event_name'):
+            payload=self.event('grok'); del payload[removed]
+            self.assertEqual(self.native('grok',payload),{})
+        self.assertEqual(self.native('grok',self.event('claude'))['decision'],'block')
+        for client in ('claude','codex'):
+            self.assertEqual(self.native(client,self.event('grok'))['decision'],'block')
+
+    def test_same_reason_after_tree_change_is_not_unchanged_rejection(self):
+        self.enroll_native('codex')
+        self.native('codex',self.event('codex'))
+        (self.repo/'source').write_text('changed source, still missing checks\n')
+        self.native('codex',self.event('codex','UserPromptSubmit',turn_id='synthetic'))
+        payload=self.event('codex',turn_id='synthetic',stop_hook_active=True)
+        result=self.native('codex',payload)
+        self.assertNotIn('Unchanged rejection',result['reason'])
+        self.assertEqual(result,self.native('codex',payload))
 
 
 if __name__ == '__main__':
