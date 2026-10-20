@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "session-one",
+  "cwd": "$REPO",
+  "stop_hook_active": false,
+  "turn_id": "turn-one"
+}

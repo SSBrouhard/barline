@@ -1,0 +1,11 @@
+{
+  "hookEventName": "stop",
+  "hook_event_name": "Stop",
+  "sessionId": "session-one",
+  "cwd": "$REPO",
+  "promptId": "turn-one",
+  "reason": "end_turn",
+  "stopHookActive": false,
+  "backgroundTasks": [],
+  "sessionCrons": []
+}

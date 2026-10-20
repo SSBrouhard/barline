@@ -2,6 +2,7 @@
 """Lean task harness. Python 3.10+, Git, POSIX. No services or dependencies."""
 import argparse
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -9,6 +10,9 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
+import shlex
+import stat
 import subprocess
 import sys
 import tarfile
@@ -20,43 +24,66 @@ class Denied(Exception):
     pass
 
 
+class CheckpointPublished(Denied):
+    def __init__(self, archive, digest, error):
+        self.archive, self.sha256 = str(archive), digest
+        super().__init__(f"Checkpoint archive published at {archive}; recover it before retrying. "
+                         f"Ledger publication not confirmed: {error}")
+
+
+def hash_stream(stream):
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def file_sha256(path):
+    with open(path, "rb") as stream:
+        return hash_stream(stream)
+
+
 def require(condition, message):
     if not condition:
         raise Denied(message)
 
 
-def git(repo, *args):
-    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+def git(repo, *args, readonly=False):
+    # Observation must not perform Git's optional index refresh or take its locks.
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0") if readonly else None
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env)
     require(p.returncode == 0, p.stderr.decode(errors="replace").strip() or "Git failed")
     return p.stdout
 
 
-def snapshot(repo):
+def snapshot(repo, readonly=False):
     repo = Path(repo).resolve()
-    require(git(repo, "rev-parse", "--show-toplevel").decode().strip() == str(repo),
+    def read_git(*args):
+        return git(repo, *args, readonly=readonly)
+    require(read_git("rev-parse", "--show-toplevel").decode().strip() == str(repo),
             "Use the repository root")
-    head = git(repo, "rev-parse", "HEAD").decode().strip()
-    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").decode().strip()
-    names = sorted(set(git(repo, "ls-files", "-z", "--cached", "--others",
+    head = read_git("rev-parse", "HEAD").decode().strip()
+    branch = read_git("rev-parse", "--abbrev-ref", "HEAD").decode().strip()
+    names = sorted(set(read_git("ls-files", "-z", "--cached", "--others",
                            "--exclude-standard").split(b"\0")) - {b""})
     h = hashlib.sha256((head + "\0" + branch).encode())
     for raw in names:
         path = repo / os.fsdecode(raw)
         h.update(len(raw).to_bytes(8, "big") + raw)
         if path.is_symlink():
-            data = os.fsencode(os.readlink(path))
+            digest = hashlib.sha256(os.fsencode(os.readlink(path))).digest()
             mode = "link"
         elif path.is_file():
-            data = path.read_bytes()
+            digest = bytes.fromhex(file_sha256(path))
             mode = str(path.stat().st_mode & 0o777)
         elif not path.exists():
-            data, mode = b"", "deleted"
+            digest, mode = hashlib.sha256(b"").digest(), "deleted"
         else:
             raise Denied("Submodules/special files need a repository-specific checkpoint adapter")
-        h.update(mode.encode() + b"\0" + hashlib.sha256(data).digest())
-    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all").decode(errors="replace")
+        h.update(mode.encode() + b"\0" + digest)
+    status = read_git("status", "--porcelain=v1", "--untracked-files=all").decode(errors="replace")
     # Include index changes too, even when worktree contents are identical.
-    h.update(git(repo, "diff", "--cached", "--binary", "HEAD"))
+    h.update(read_git("diff", "--cached", "--binary", "HEAD"))
     return {"head": head, "branch": branch, "fingerprint": h.hexdigest(), "dirty": bool(status),
             "status": status, "files": [os.fsdecode(x) for x in names]}
 
@@ -117,9 +144,11 @@ def contract(c):
     return c
 
 
-def gate(t):
-    now = snapshot(t["repo"])
-    latest = {e["check"]: e for e in t["evidence"] if e["fingerprint"] == now["fingerprint"]}
+def gate(t, now=None):
+    now = snapshot(t["repo"]) if now is None else now
+    # A newer attempt supersedes the old one even if its source no longer matches.
+    attempts = {e["check"]: e for e in t["evidence"]}
+    latest = {name: e for name, e in attempts.items() if e["fingerprint"] == now["fingerprint"]}
     missing = [name for name in t["contract"]["checks"] if name not in latest]
     failed = [name for name, e in latest.items() if e["status"] == "FAIL"]
     blocked = [name for name, e in latest.items() if e["status"] == "BLOCKED"]
@@ -155,6 +184,81 @@ def gate(t):
             "assurance": "Local checks are executed. Scope and external verification are lead-recorded claims; external sources are not fetched by this CLI."}
 
 
+@contextlib.contextmanager
+def observation_task(state, task, repo=None):
+    """Validate exact task identity under its existing read-only ledger lock."""
+    path = Path(state).resolve()
+    # No mkdir, append-open or save: absence of the existing lock is unavailable.
+    with open(str(path) + ".lock", "rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Denied("Lead ledger is busy; retry observation after its atomic action")
+        raw = path.read_bytes()
+        s = json.loads(raw)
+        require(type(s) is dict and type(s.get("version")) is int and s["version"] == 2,
+                "Unsupported ledger version; preserve it unchanged")
+        require(type(s.get("tasks")) is dict and task in s["tasks"], "Exact enrolled task is missing")
+        t = s["tasks"][task]
+        require(type(t) is dict, "Invalid task record")
+        contract(t["contract"])
+        require(t["work_state"] in ("ACTIVE", "PAUSED") and
+                t["scope_outcome"] in ("unknown", "not-met", "met") and
+                type(t["failed_hypotheses"]) is int and t["failed_hypotheses"] >= 0,
+                "Invalid task state")
+        require(type(t["evidence"]) is list and type(t["external"]) is list, "Invalid evidence records")
+        require(type(t.get("contract_conflicts", [])) is list and
+                ("superseded_by" not in t or isinstance(t["superseded_by"], str) and bool(t["superseded_by"])),
+                "Invalid task conflict or successor record")
+        for evidence in t["evidence"]:
+            require(evidence["check"] in t["contract"]["checks"] and
+                    evidence["status"] in ("PASS", "FAIL", "BLOCKED", "INCONCLUSIVE") and
+                    isinstance(evidence["fingerprint"], str), "Invalid check evidence")
+        for receipt in t["external"]:
+            require(receipt["kind"] in t["contract"]["required_external"] and
+                    receipt["result"] in ("PASS", "FAIL", "BLOCKED", "INCONCLUSIVE"),
+                    "Invalid external receipt")
+        target = Path(t["repo"]).resolve()
+        require(repo is None or target == Path(repo).resolve(), "Enrolled checkout differs from task")
+        repos = [str(Path(value["repo"]).resolve()) for value in s["tasks"].values()]
+        require(not any(path.is_relative_to(Path(root)) for root in repos),
+                "Ledger must be outside every target checkout")
+        require(target.is_dir(), "Enrolled checkout is unavailable")
+        yield path, raw, t, target, repos
+
+
+def task_identity(state, task, repo):
+    """No-write turn validation; no Git, source traversal or acceptance claim."""
+    with observation_task(state, task, repo) as (path, raw, t, target, repos):
+        return {"task": task, "repo": str(target), "state": str(path), "repos": repos}
+
+
+def observe(state, task, repo=None):
+    """No-write observation. Call in a deadline-supervised process for hook use."""
+    with observation_task(state, task, repo) as (path, raw, t, target, repos):
+        before = snapshot(target, readonly=True)
+        result = gate(t, now=before)
+        pause_valid = False
+        if t["work_state"] == "PAUSED":
+            cp = t.get("checkpoint", {})
+            try:
+                pause_valid = bool(t.get("next", "").strip() and
+                    t.get("checkpoint_snapshot", {}).get("fingerprint") == before["fingerprint"] and
+                    cp.get("sha256") and file_sha256(cp["path"]) == cp["sha256"])
+            except OSError:
+                # A broken archive prevents certifying pause, but the lead may
+                # still need a truthful input/blocker handoff about its recovery.
+                pause_valid = False
+        after = snapshot(target, readonly=True)
+        require(before == after and path.read_bytes() == raw,
+                "Repository or ledger changed during observation; retry without starting duplicate checks")
+        result.update(task=task, repo=str(target), state=str(path), repos=repos,
+                      ledger_digest=hashlib.sha256(raw).hexdigest(),
+                      failed_hypotheses=t["failed_hypotheses"], pause_valid=pause_valid,
+                      next=t.get("next"))
+        return result
+
+
 def execute(s, t, name, state_path):
     admit(t)
     require(name in t["contract"]["checks"], "Command is outside frozen contract")
@@ -165,7 +269,7 @@ def execute(s, t, name, state_path):
     logs = state_path.parent / (state_path.stem + "-logs")
     logs.mkdir(exist_ok=True)
     log = logs / (rid + ".log")
-    e = {"check": name, "status": "BLOCKED", "exit_code": None, "argv": c["argv"],
+    e = {"attempt_id": rid, "check": name, "status": "BLOCKED", "exit_code": None, "argv": c["argv"],
          "expected_exit": c.get("expected_exit", 0), "fingerprint": before["fingerprint"],
          "head": before["head"], "log": str(log),
          "detail": "Check started without a recorded completion; verify owned process before rerunning",
@@ -204,55 +308,132 @@ def execute(s, t, name, state_path):
     return e
 
 
+def checkpoint_logs(s, stage):
+    """Capture the embedded ledger's log closure, keeping physical aliases together."""
+    references, physical, members = [], {}, set()
+    finished = {e["id"] for e in s["events"] if e.get("event") == "check-finish"}
+    for task_id, task in s["tasks"].items():
+        for index, evidence in enumerate(task["evidence"]):
+            source = Path(evidence["log"])
+            ref = {"task": task_id, "evidence_index": index, "source": str(source)}
+            try:
+                require(stat.S_ISREG(source.stat().st_mode), f"Check log is not a regular file: {source}")
+                with source.open("rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    require(stat.S_ISREG(info.st_mode), f"Check log is not a regular file: {source}")
+                    key = (info.st_dev, info.st_ino)
+                    if key not in physical:
+                        member = "logs/" + source.name
+                        suffix = 1
+                        while member in members:
+                            member = f"logs/{suffix}-{source.name}"
+                            suffix += 1
+                        members.add(member)
+                        captured = stage / member
+                        captured.parent.mkdir(exist_ok=True)
+                        with captured.open("wb") as destination:
+                            shutil.copyfileobj(stream, destination)
+                        physical[key] = {"member": member, "sha256": file_sha256(captured)}
+                    ref.update(availability="available", **physical[key])
+            except FileNotFoundError:
+                attempt = evidence.get("attempt_id", source.stem)
+                unfinished = (evidence.get("status") == "BLOCKED" and
+                              evidence.get("exit_code") is None and attempt not in finished and
+                              evidence.get("detail") ==
+                              "Check started without a recorded completion; verify owned process before rerunning")
+                require(unfinished, f"Completed check log missing for task {task_id}, "
+                        f"evidence {index}: {source}; recover the log before checkpointing")
+                ref.update(availability="unavailable", creation_history="unknown",
+                           reason="Unfinished attempt log absent; it may never have opened or may have been deleted")
+            references.append(ref)
+    manifest = {"version": 1, "references": references}
+    (stage / "log-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def checkpoint(s, t, output, note):
     output = Path(output).resolve()
     repo = Path(t["repo"])
     require(not output.is_relative_to(repo), "Checkpoint must live outside the source repository")
     require(not output.exists(), "Checkpoint already exists; use a new path")
     current = snapshot(repo)
-    t["work_state"] = "PAUSED"
-    t["checkpoint_snapshot"] = current
-    t["next"] = note
-    t["checkpoint"] = {"path": str(output), "durability": "unconfirmed"}
+    # Archive failure must not leak a PAUSED state into the caller's live session.
+    staged = copy.deepcopy(s)
+    task_id = next(key for key, value in s["tasks"].items() if value is t)
+    target = staged["tasks"][task_id]
+    target.update(work_state="PAUSED", checkpoint_snapshot=current, next=note,
+                  checkpoint={"path": str(output), "durability": "unconfirmed"})
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as td:
-        stage = Path(td)
-        git(repo, "bundle", "create", str(stage / "history.bundle"), "--all")
-        (stage / "state.json").write_text(json.dumps(s, indent=2))
-        (stage / "resume.md").write_text(
-            f"# Resume {t['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(t)['validation']}.\n"
-            f"Head: {current['head']}\nFingerprint: {current['fingerprint']}\n"
-            f"Failed hypotheses: {t['failed_hypotheses']}.\nNext: {note}\n\n"
-            "Read state.json for the frozen contract, original request, evidence and session history.\n"
-            "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
-            "then record its receipt using `durable`. Do not push merely to save state.\n"
-            "Recovery: clone history.bundle into a NEW directory, checkout the recorded head, "
-            "remove files absent from the worktree member list, overlay worktree/, then replay index.patch. "
-            "Restore state.json and logs beside the repo, update only the repo/log path mappings, "
-            "and compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
-        (stage / "index.patch").write_bytes(git(repo, "diff", "--cached", "--binary", "HEAD"))
-        fd, tmp = tempfile.mkstemp(dir=output.parent, prefix=".checkpoint-")
-        os.close(fd)
-        try:
-            with tarfile.open(tmp, "w:gz") as tar:
-                for item in stage.iterdir():
-                    tar.add(item, arcname=item.name)
-                for name in current["files"]:
-                    p = repo / name
-                    if p.exists() or p.is_symlink():
-                        tar.add(p, arcname="worktree/" + name, recursive=False)
-                for e in t["evidence"]:
-                    if Path(e["log"]).exists():
-                        tar.add(e["log"], arcname="logs/" + Path(e["log"]).name)
-            require(snapshot(repo)["fingerprint"] == current["fingerprint"], "Source changed while archiving; retry")
-            with tarfile.open(tmp) as tar:
-                require("history.bundle" in tar.getnames() and "state.json" in tar.getnames(), "Incomplete archive")
-            os.replace(tmp, output)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    t["checkpoint"]["sha256"] = digest
+    published, digest = False, None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stage = Path(td)
+            manifest = checkpoint_logs(staged, stage)
+            git(repo, "bundle", "create", str(stage / "history.bundle"), "--all", "HEAD")
+            (stage / "state.json").write_text(json.dumps(staged, indent=2))
+            (stage / "resume.md").write_text(
+                f"# Resume {target['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(target)['validation']}.\n"
+                f"Head: {current['head']}\nFingerprint: {current['fingerprint']}\n"
+                f"Failed hypotheses: {target['failed_hypotheses']}.\nNext: {note}\n\n"
+                "Read state.json for the frozen contract, original request, evidence and session history.\n"
+                "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
+                "then record its receipt using `durable`. Do not push merely to save state.\n"
+                "Recover only an archive from a trusted source: it contains Git history and working files. "
+                "Run the following shell block with the NEW destination as its first positional argument. "
+                "If the archive moved, pass its current path as the second argument. "
+                "Use the companion recover.py beside this version of lean.py; update its tool path if the harness moved.\n\n"
+                "```sh\n"
+                ': "${1:?Pass a NEW recovery destination as argument 1}"\n'
+                f"archive={shlex.quote(str(output))}\n"
+                'if [ "$#" -ge 2 ]; then archive=$2; fi\n'
+                f"python3 {shlex.quote(str(Path(__file__).resolve().with_name('recover.py')))} "
+                f'"$archive" "$1" --task {shlex.quote(task_id)}\n```\n\n'
+                "Recovery verifies the original fingerprint, preserves the archive bytes, and creates "
+                "repo/, state.json and remapped logs in that new directory. Only the selected checkout "
+                "is restored. Other task checkout paths remain historical; all available log paths are remapped. "
+                "Unavailable unfinished logs remain absent with unknown creation history. "
+                "Read the recovered frozen contract/history, confirm authorized persistent storage using durable, "
+                "then compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
+            (stage / "index.patch").write_bytes(git(repo, "diff", "--cached", "--binary", "HEAD"))
+            fd, tmp = tempfile.mkstemp(dir=output.parent, prefix=".checkpoint-")
+            os.close(fd)
+            try:
+                with tarfile.open(tmp, "w:gz") as tar:
+                    for item in stage.iterdir():
+                        tar.add(item, arcname=item.name)
+                    for name in current["files"]:
+                        p = repo / name
+                        if p.exists() or p.is_symlink():
+                            def regular_payload(info):
+                                # Inode sharing is outside snapshot identity; store regular bytes.
+                                if info.islnk():
+                                    info.type, info.linkname, info.size = tarfile.REGTYPE, "", p.stat().st_size
+                                return info
+                            tar.add(p, arcname="worktree/" + name, recursive=False, filter=regular_payload)
+                require(snapshot(repo)["fingerprint"] == current["fingerprint"], "Source changed while archiving; retry")
+                with tarfile.open(tmp) as tar:
+                    require("history.bundle" in tar.getnames() and "state.json" in tar.getnames(), "Incomplete archive")
+                    digests = {}
+                    for ref in manifest["references"]:
+                        if ref["availability"] == "available":
+                            member = ref["member"]
+                            if member not in digests:
+                                with tar.extractfile(member) as stream:
+                                    digests[member] = hash_stream(stream)
+                            require(digests[member] == ref["sha256"], "Archived log digest differs")
+                os.replace(tmp, output)
+                published = True
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        digest = file_sha256(output)
+    except (Denied, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+        if published:
+            raise CheckpointPublished(output, digest, exc) from exc
+        raise
+    target["checkpoint"]["sha256"] = digest
+    t.clear()
+    t.update(target)
     return {"archive": str(output), "sha256": digest, "durability": "unconfirmed", "work_state": "PAUSED"}
 
 
@@ -261,6 +442,9 @@ def parser():
     p.add_argument("--state", required=True, type=Path, help="One lead-owned session ledger OUTSIDE target repositories")
     sp = p.add_subparsers(dest="command", required=True)
     sp.add_parser("init")
+    observation = sp.add_parser("observe", help="Supervised read-only gate query; never saves the ledger")
+    observation.add_argument("--task", required=True)
+    observation.add_argument("--timeout", type=float, default=5)
     start = sp.add_parser("start")
     start.add_argument("--repo", required=True, type=Path)
     start.add_argument("--contract", required=True, type=Path)
@@ -294,6 +478,13 @@ def parser():
 
 def main(argv=None):
     a = parser().parse_args(argv)
+    if a.command == "observe":
+        # Keep all traversal, JSON loading and Git work inside the bounded worker.
+        sys.dont_write_bytecode = True
+        from hooks.stop import supervise
+        result = supervise({"operation": "observe", "state": str(a.state), "task": a.task}, a.timeout)
+        print(json.dumps(result, indent=2))
+        return 2 if result.get("decision") == "block" else 0
     try:
         with locked(a.state) as path:
             if a.command == "init":
@@ -390,13 +581,21 @@ def main(argv=None):
                                               "result": a.result, "assurance": "Lead-recorded external verification; CLI does not fetch or authenticate source"})
                         result = gate(t)
             s["events"].append({"event": a.command, "time": time.time()})
-            save(path, s)
+            try:
+                save(path, s)
+            except OSError as exc:
+                if a.command == "checkpoint":
+                    raise CheckpointPublished(result["archive"], result["sha256"], exc) from exc
+                raise
             print(json.dumps(result, indent=2))
             if a.command == "gate": return 0 if result["validation"] == "PASS" else 1
             if a.command == "run": return 0 if result["status"] == "PASS" else 1
             return 0
-    except (Denied, OSError, ValueError, KeyError, TypeError) as exc:
-        print(json.dumps({"status": "BLOCKED", "reason": str(exc)}), file=sys.stderr)
+    except (Denied, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+        error = {"status": "BLOCKED", "reason": str(exc)}
+        if isinstance(exc, CheckpointPublished):
+            error.update(archive=exc.archive, sha256=exc.sha256, ledger_publication="unconfirmed")
+        print(json.dumps(error), file=sys.stderr)
         return 2
 
 

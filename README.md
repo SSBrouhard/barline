@@ -26,7 +26,11 @@ The everyday flow is user request, frozen contract, implementation, relevant che
 
 Local checks execute, log their command/exit/result/environment, and bind evidence to HEAD, branch, index, tracked files and nonignored untracked files. An edit or branch switch makes old checks stale. Source-mutating checks become INCONCLUSIVE. Ignored dependencies/build output and external state are not fingerprinted; report environmental limits and add repo-specific behavioral checks when needed.
 
+Only the latest attempt for each check can qualify, and it must PASS on the current fingerprint. Returning to an earlier tree cannot revive its older pass after a newer failed, blocked or inconclusive attempt. A latest attempt on a different tree is reported in `missing`; rerun that check unchanged on the current tree. Other checks keep their own attempt history.
+
 `assess` is the lead's recorded acceptance judgment, separate from command evidence. A PASS says every configured local check passed on this tree and the lead marked its bar met. It does not certify arbitrary semantics, independent review or a deployed system. Work state (ACTIVE/PAUSED), scope and validation (PASS/FAIL/BLOCKED/INCONCLUSIVE) stay separate.
+
+Optional [completion hooks](docs/completion-hooks.md) reuse a read-only gate observation and distinguish acceptance from explicit non-completion handoffs. Claude Code, Codex CLI and Grok CLI adapters have deterministic process coverage and version-specific native smoke evidence. Native failures and continuation caps can still let a client stop while Lean remains nonpassing. See the guide's validation status before opting in. Adding the examples does not activate them.
 
 ### Follow-ups and frozen contracts
 
@@ -57,7 +61,7 @@ Only the lead mutates the ledger and owns integration, evidence and completion. 
 
 T3's `delegate_task` supplies child task records, provider/model selection, worktree isolation and async completion notifications. Worktree children start from the parent's local commit; uncommitted edits are absent. The lead verifies the base commit, reads `task_status` and the durable child timeline, inspects actual artifacts and runs named checks. T3 limits a child's runtime mode to the parent's ceiling. A narrower mode can require human approval; it does not make the child read-only. No-edit, no-further-delegation and publication restrictions remain instructions even when children have orchestration tools. See [PRINCIPLES.md](PRINCIPLES.md) for optional, pinned, on-demand decision guidance.
 
-The executable exclusively locks the ledger and writes it atomically. It records a BLOCKED check result before launch and replaces that provisional result only after observing completion. A lead crash therefore cannot expose an older PASS for the same check/tree. The record includes the process group when known; after a crash, verify and clean up owned work before rerunning. Never blindly signal a recorded PID, which may have been reused. Check timeouts and interruption terminate the owned process group. Check output goes to local log files; log size is not capped.
+The executable exclusively locks the ledger and writes it atomically. It records a BLOCKED check result before launch and replaces that provisional result only after observing completion. A lead crash therefore cannot expose an older PASS for the same check, even after source restoration. The record includes the process group when known; after a crash, verify and clean up owned work before rerunning. Never blindly signal a recorded PID, which may have been reused. Check timeouts and interruption terminate the owned process group. Check output goes to local log files; log size is not capped.
 
 `hypothesis --task fix --description 'specific causal explanation' --result failed` records a repair attempt. Two failed hypotheses block new work. `park --task fix --next 'unrelated discovery'` records scope exclusions. These declarations are procedural accounting, not automatic detection of what the agent thinks or does.
 
@@ -69,7 +73,11 @@ A checkpoint plus `diagnose --task fix --new-evidence 'new reproducer/source fin
 python3 /path/lean-harness/lean.py --state /path/work/session.json checkpoint --task fix --output /path/work/fix-checkpoint.tar.gz --next 'Inspect failing fixture, then rerun test'
 ```
 
-The archive contains Git history, the actual nonignored working files (including untracked work), staged patch, ledger, check logs and a short resume note. Deleted files are absent from `worktree/`; recovery instructions explain removal before overlay. Submodules/special files are rejected rather than incompletely preserved. Ignored files, credentials, external services and installed dependencies are outside the archive's coverage. Use an adapter if unfinished work depends on them. Tracked/nonignored files are included as-is; preserve only in an authorized destination with the appropriate access.
+The archive contains Git history, the actual nonignored working files (including untracked work), staged patch, ledger, check logs and a short resume note. Deleted files are absent from `worktree/`; recovery replaces the cloned worktree before overlaying the captured files. Named branches, detached HEAD, staged changes, file modes and symlinks retain their fingerprint identity. Submodules/special files are rejected rather than incompletely preserved. Ignored files, credentials, external services and installed dependencies are outside the archive's coverage. Use an adapter if unfinished work depends on them. Tracked/nonignored files are included as-is; preserve only in an authorized destination with the appropriate access.
+
+`log-manifest.json` maps every task/evidence index in the embedded session to its captured log member and SHA-256. Logs from predecessor tasks and other repositories are included; repeated physical files share one payload and colliding basenames have distinct member names. Only the selected task's checkout and Git history are backed up. A missing completed-run log blocks checkpoint creation. A missing unfinished-attempt log is marked unavailable with unknown creation history: the ledger cannot prove whether it was never opened or was later deleted.
+
+Before archive publication, a checkpoint failure leaves the ledger and requested output unchanged. Archive publication and ledger save are separate operations. If hashing or ledger publication fails after the archive is published, the error identifies the recoverable archive path and its hash when known; inspect that archive and the unchanged ledger before deciding how to reconcile them. Do not blindly repeat checkpoint creation at another path.
 
 Child tasks and separate worktrees are outside this archive. Before checkpointing, consult actual T3 records and include task IDs/providers, status/evidence, worktree/branch, integration state and remaining work in `--next` or a referenced external handoff. Separately preserve unintegrated artifacts when needed. On resume, read `task_status` and inspect those worktrees before repeating work; do not automatically cancel tasks or delete worktrees. This uses the existing checkpoint format.
 
@@ -80,7 +88,17 @@ python3 /path/lean-harness/lean.py --state /path/work/session.json durable --tas
 python3 /path/lean-harness/lean.py --state /path/work/session.json resume --task fix --expect RECORDED_FINGERPRINT
 ```
 
-Persist the finalized ledger as well. The archive's embedded ledger is the pre-receipt recovery record; on full restoration update only physical repo/log/archive paths and the archive hash, re-confirm durable storage, and preserve contracts, evidence and hypothesis history. Never extract over existing user work. `resume.md` describes clone/overlay/index restoration into a new directory. Compare the fingerprint before continuing.
+Persist the finalized ledger as well. The archive's embedded ledger is the pre-receipt recovery record. Restore a trusted checkpoint with the companion `recover.py` installed beside the same version of `lean.py`:
+
+```sh
+python3 /path/lean-harness/recover.py /path/fix-checkpoint.tar.gz /path/NEW-recovery-directory --task fix
+```
+
+The destination must not exist, and its parent must exist. The helper validates archive paths and member types, creates `repo/`, restores the recorded named branch or detached HEAD, replays the index, and verifies the full fingerprint. It copies the original archive without changing its bytes, restores every available task log using the manifest, and writes a relocated `state.json`. Only the selected task's checkout path is changed; other checkout paths remain historical because their repositories are outside this checkpoint. Contracts, conflicts, check results, external receipts, hypotheses and embedded event history stay intact. Original embedded records remain in `archived-state.json` and `archived-log-manifest.json`. Unavailable unfinished logs remain absent; the recovery result lists them with unknown creation history.
+
+`resume.md` includes the exact executable shell block used by recovery tests. Save that block as a script and pass its NEW destination as argument 1; argument 2 optionally supplies a relocated archive path. Its tool path points to the installed companion; update that path if the harness moved to another machine. Recovery requires Python, Git and this harness installation. It does not install dependencies or establish durability. Read the recovered contract and history, preserve the archive and ledger in an authorized persistent destination, then use `durable` with the real receipt and `resume --expect FINGERPRINT` before continuing.
+
+For older format-2 archives, use the same companion command rather than the old checkout-by-commit instructions. The helper restores the saved branch and index without editing the old archive or its hash. Legacy archives without a manifest are recoverable only when every referenced log is present with unambiguous basenames. Missing logs or an omitted detached commit cannot be reconstructed: recovery stops and explains the missing evidence instead of inventing it. Unsupported format-1 ledgers, special members, missing required members and mismatched restored fingerprints also stop recovery. Existing user work is never overwritten.
 
 ## Ledger format and existing sessions
 
