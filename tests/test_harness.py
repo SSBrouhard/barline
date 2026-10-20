@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import re
 import signal
 from pathlib import Path
 import subprocess
@@ -698,33 +699,217 @@ class HarnessTests(unittest.TestCase):
         self.call("resume", "--task", "one", "--expect", original, code=2)
         self.call("durable", "--task", "one", "--location", "test persistent destination receipt")
         self.call("resume", "--task", "one", "--expect", original)
-        extracted = self.root / "extracted"
-        # This archive was created from this test's trusted temporary fixture.
-        # Python 3.10 before 3.10.12 has no extraction-filter API.
-        with tarfile.open(output) as tar:
-            options = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
-            tar.extractall(extracted, **options)
         restored = self.root / "restored"
-        subprocess.check_call(["git", "clone", "-q", str(extracted / "history.bundle"), str(restored)])
-        for source in (extracted / "worktree").iterdir():
-            (restored / source.name).write_bytes(source.read_bytes())
-        self.git("apply", "--cached", str(extracted / "index.patch"), repo=restored)
-        self.assertEqual((restored / "source.txt").read_text(), "unstaged")
-        self.assertEqual(self.git("show", ":source.txt", repo=restored), b"staged")
-        self.assertEqual((restored / "new.txt").read_text(), "untracked")
-        self.assertTrue((extracted / "logs").is_dir())
-        recovered = json.loads((extracted / "state.json").read_text())
+        self.run_generated_recovery(output, restored)
+        self.assertEqual((restored / "repo/source.txt").read_text(), "unstaged")
+        self.assertEqual(self.git("show", ":source.txt", repo=restored / "repo"), b"staged")
+        self.assertEqual((restored / "repo/new.txt").read_text(), "untracked")
+        self.state = restored / "state.json"
+        recovered = json.loads(self.state.read_text())
         task = recovered["tasks"]["one"]
-        task["repo"] = str(restored)
-        task["checkpoint"]["sha256"] = cp["sha256"]
-        for e in task["evidence"]:
-            e["log"] = str(extracted / "logs" / Path(e["log"]).name)
-        self.state = extracted / "state.json"
-        self.state.write_text(json.dumps(recovered))
+        self.assertEqual(task["checkpoint"]["sha256"], cp["sha256"])
         self.call("durable", "--task", "one", "--location", "recovered fixture receipt")
         self.call("resume", "--task", "one", "--expect", original)
         self.assertEqual(self.gate(code=0)["validation"], "PASS")
         self.assertEqual(json.loads(self.state.read_text())["tasks"]["one"]["contract"], task["contract"])
+
+    def run_generated_recovery(self, archive, destination, relocated=None, code=0):
+        with tarfile.open(archive) as tar:
+            resume = tar.extractfile("resume.md").read().decode()
+        blocks = re.findall(r"```sh\n(.*?)```", resume, re.S)
+        self.assertEqual(len(blocks), 1, "Recovery needs one executable shell block")
+        result = subprocess.run(["sh", "-c", blocks[0], "resume", str(destination),
+                                 *([str(relocated)] if relocated else [])],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        return json.loads(result.stdout or result.stderr)
+
+    def test_generated_recovery_preserves_named_branch_full_identity_and_session(self):
+        self.git("checkout", "-qb", "repair/nondefault")
+        for name in ("deleted.txt", "staged-deleted.txt", "executable"):
+            (self.repo / name).write_text("base")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Recovery base")
+        c = self.setup_task()
+        self.run_check()
+        c["owner_request"] = "linked recovery authorization"
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "two", "--follows", "one", "--repo", self.repo,
+                  "--contract", self.contract)
+        (self.repo / "source.txt").write_text("staged")
+        (self.repo / "executable").chmod(0o755)
+        self.git("add", "source.txt", "executable")
+        (self.repo / "source.txt").write_text("unstaged")
+        (self.repo / "deleted.txt").unlink()
+        self.git("rm", "--quiet", "staged-deleted.txt")
+        nested = self.repo / "nested space"
+        nested.mkdir()
+        (nested / "new.txt").write_bytes(b"untracked\x00bytes")
+        (nested / "link").symlink_to("../source.txt")
+        os.link(self.repo / "source.txt", nested / "hardlink")
+        self.call("run", "--task", "two", "--check", "test")
+        self.call("assess", "--task", "two", "--outcome", "met", "--evidence", "Fixture accepted")
+        output = self.root / "source checkpoint.tgz"
+        receipt = self.call("checkpoint", "--task", "two", "--output", output, "--next", "Continue")
+        before = json.loads(self.state.read_text())
+        logs = {(tid, i): Path(e["log"]).read_bytes() for tid, t in before["tasks"].items()
+                for i, e in enumerate(t["evidence"])}
+        with tarfile.open(output) as tar:
+            block = re.findall(r"```sh\n(.*?)```", tar.extractfile("resume.md").read().decode(), re.S)[0]
+            archived_events = json.load(tar.extractfile("state.json"))["events"]
+        relocated = self.root / "moved ' $ checkpoint.tgz"
+        output.rename(relocated)
+        HARNESS.shutil.rmtree(self.repo)
+        self.state.unlink()
+        HARNESS.shutil.rmtree(self.root / "session-logs")
+        restored = self.root / "new recovery"
+        result = subprocess.run(["sh", "-c", block, "resume", str(restored), str(relocated)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.state = restored / "state.json"
+        recovered = json.loads(self.state.read_text())
+        self.assertEqual(HARNESS.snapshot(restored / "repo")["fingerprint"],
+                         before["tasks"]["two"]["checkpoint_snapshot"]["fingerprint"])
+        self.assertEqual(self.git("branch", "--show-current", repo=restored / "repo").decode().strip(),
+                         "repair/nondefault")
+        self.assertEqual((restored / "repo/executable").stat().st_mode & 0o777, 0o755)
+        self.assertEqual(os.readlink(restored / "repo/nested space/link"), "../source.txt")
+        self.assertFalse((restored / "repo/deleted.txt").exists())
+        self.assertFalse((restored / "repo/staged-deleted.txt").exists())
+        self.assertEqual((restored / "repo/nested space/new.txt").read_bytes(), b"untracked\x00bytes")
+        for tid, task in recovered["tasks"].items():
+            expected = copy.deepcopy(before["tasks"][tid])
+            for i, evidence in enumerate(task["evidence"]):
+                self.assertEqual(Path(evidence["log"]).read_bytes(), logs[tid, i])
+                expected["evidence"][i]["log"] = evidence["log"]
+            if tid == "two":
+                expected["repo"] = str((restored / "repo").resolve())
+                expected["checkpoint"]["path"] = str((restored / "checkpoint.tar.gz").resolve())
+            self.assertEqual(task, expected)
+        self.assertEqual(recovered["events"], archived_events)
+        self.assertEqual(HARNESS.file_sha256(relocated), receipt["sha256"])
+        self.assertEqual(HARNESS.file_sha256(restored / "checkpoint.tar.gz"), receipt["sha256"])
+        self.call("durable", "--task", "two", "--location", "Authorized fixture storage receipt")
+        self.call("resume", "--task", "two", "--expect", json.loads(result.stdout)["fingerprint"])
+        self.assertEqual(self.call("gate", "--task", "two")["validation"], "PASS")
+
+    def test_generated_recovery_preserves_unreferenced_detached_head(self):
+        self.git("checkout", "--quiet", "--detach")
+        (self.repo / "source.txt").write_text("detached-only commit")
+        self.git("commit", "-qam", "Detached commit")
+        self.assertEqual(self.git("for-each-ref", "--contains", "HEAD"), b"")
+        self.setup_task()
+        output = self.root / "detached.tgz"
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue")
+        restored = self.root / "detached recovery"
+        self.run_generated_recovery(output, restored)
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", repo=restored / "repo"), b"HEAD\n")
+        self.assertEqual(HARNESS.snapshot(restored / "repo")["fingerprint"], HARNESS.snapshot(self.repo)["fingerprint"])
+
+    def rewritten_archive(self, source, destination, omit=(), extra=()):
+        with tarfile.open(source) as original, tarfile.open(destination, "w:gz") as rewritten:
+            for member in original.getmembers():
+                if member.name not in omit:
+                    rewritten.addfile(member, original.extractfile(member) if member.isfile() else None)
+            for member, data in extra:
+                rewritten.addfile(member, io.BytesIO(data) if data is not None else None)
+        return destination
+
+    def test_recovery_rejects_existing_destination_special_and_missing_members(self):
+        self.setup_task()
+        self.run_check()
+        output = self.root / "valid.tgz"
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue")
+        helper = CLI.with_name("recover.py")
+        existing = self.root / "existing"
+        existing.mkdir()
+        (existing / "owned.txt").write_text("untouched")
+        result = self.run_generated_recovery(output, existing, code=2)
+        self.assertIn("already exists", result["reason"])
+        self.assertEqual((existing / "owned.txt").read_text(), "untouched")
+        dangling = self.root / "dangling"
+        dangling.symlink_to(self.root / "absent")
+        self.assertIn("already exists", self.run_generated_recovery(output, dangling, code=2)["reason"])
+        special = tarfile.TarInfo("worktree/fifo")
+        special.type = tarfile.FIFOTYPE
+        escape = tarfile.TarInfo("../escaped")
+        escape.size = 4
+        linked_parent = tarfile.TarInfo("worktree/nested")
+        linked_parent.type = tarfile.SYMTYPE
+        linked_parent.linkname = "../outside"
+        nested_child = tarfile.TarInfo("worktree/nested/file")
+        nested_child.size = 4
+        cases = [("missing-bundle", ("history.bundle",), (), "Missing required"),
+                 ("missing-source", ("worktree/source.txt",), (), "fingerprint differs"),
+                 ("special", (), ((special, None),), "special archive member"),
+                 ("escape", (), ((escape, b"oops"),), "Unsafe archive member"),
+                 ("linked-parent", (), ((linked_parent, None), (nested_child, b"oops")),
+                  "Nondirectory archive parent")]
+        with tarfile.open(output) as tar:
+            log = json.load(tar.extractfile("log-manifest.json"))["references"][0]["member"]
+        cases.append(("missing-log", (log,), (), "Missing regular log member"))
+        for name, omit, extra, reason in cases:
+            with self.subTest(name=name):
+                modified = self.rewritten_archive(output, self.root / (name + ".tgz"), omit, extra)
+                dest = self.root / (name + "-recovery")
+                process = subprocess.run([sys.executable, str(helper), str(modified), str(dest), "--task", "one"],
+                                         capture_output=True, text=True)
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn(reason, json.loads(process.stderr)["reason"])
+                self.assertFalse(dest.exists())
+
+    def test_companion_recovers_old_archive_without_rewriting_it(self):
+        self.git("checkout", "-qb", "legacy/named")
+        self.setup_task()
+        self.run_check()
+        output = self.root / "new.tgz"
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Continue")
+        old_resume = tarfile.TarInfo("resume.md")
+        old_note = b"Old clone/checkout-head/overlay instructions\n"
+        old_resume.size = len(old_note)
+        legacy = self.rewritten_archive(output, self.root / "old.tgz",
+                                        ("log-manifest.json", "resume.md"), ((old_resume, old_note),))
+        before = legacy.read_bytes()
+        dest = self.root / "legacy-recovery"
+        process = subprocess.run([sys.executable, str(CLI.with_name("recover.py")),
+                                  str(legacy), str(dest), "--task", "one"], capture_output=True, text=True)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertEqual((dest / "checkpoint.tar.gz").read_bytes(), before)
+        self.assertEqual((dest / "archived-resume.md").read_bytes(), old_note)
+        self.assertEqual(HARNESS.snapshot(dest / "repo")["fingerprint"], HARNESS.snapshot(self.repo)["fingerprint"])
+        with tarfile.open(legacy) as tar:
+            missing = next(m.name for m in tar.getmembers() if m.isfile() and m.name.startswith("logs/"))
+        incomplete = self.rewritten_archive(legacy, self.root / "old-missing.tgz", (missing,))
+        failed = subprocess.run([sys.executable, str(CLI.with_name("recover.py")),
+                                 str(incomplete), str(self.root / "old-missing"), "--task", "one"],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("recover its original bytes separately", json.loads(failed.stderr)["reason"])
+        self.assertFalse((self.root / "old-missing").exists())
+
+    def test_recovery_keeps_unavailable_unfinished_log_history_unknown(self):
+        self.setup_task()
+        self.run_check()
+        session = json.loads(self.state.read_text())
+        evidence = session["tasks"]["one"]["evidence"][0]
+        evidence.update(status="BLOCKED", exit_code=None,
+                        detail="Check started without a recorded completion; verify owned process before rerunning")
+        session["events"] = [e for e in session["events"] if e["event"] != "check-finish"]
+        Path(evidence["log"]).unlink()
+        self.state.write_text(json.dumps(session))
+        output = self.root / "unfinished.tgz"
+        self.call("checkpoint", "--task", "one", "--output", output, "--next", "Inspect owned process")
+        dest = self.root / "unfinished-recovery"
+        result = self.run_generated_recovery(output, dest)
+        self.assertEqual(result["unavailable_logs"],
+                         [{"task": "one", "evidence_index": 0, "creation_history": "unknown"}])
+        recovered = json.loads((dest / "state.json").read_text())
+        record = recovered["tasks"]["one"]["evidence"][0]
+        self.assertFalse(Path(record["log"]).exists())
+        original = copy.deepcopy(evidence)
+        original["log"] = record["log"]
+        self.assertEqual(record, original)
 
     def test_resume_refuses_mismatched_tree(self):
         self.setup_task()

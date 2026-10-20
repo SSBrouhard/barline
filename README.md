@@ -71,7 +71,7 @@ A checkpoint plus `diagnose --task fix --new-evidence 'new reproducer/source fin
 python3 /path/lean-harness/lean.py --state /path/work/session.json checkpoint --task fix --output /path/work/fix-checkpoint.tar.gz --next 'Inspect failing fixture, then rerun test'
 ```
 
-The archive contains Git history, the actual nonignored working files (including untracked work), staged patch, ledger, check logs and a short resume note. Deleted files are absent from `worktree/`; recovery instructions explain removal before overlay. Submodules/special files are rejected rather than incompletely preserved. Ignored files, credentials, external services and installed dependencies are outside the archive's coverage. Use an adapter if unfinished work depends on them. Tracked/nonignored files are included as-is; preserve only in an authorized destination with the appropriate access.
+The archive contains Git history, the actual nonignored working files (including untracked work), staged patch, ledger, check logs and a short resume note. Deleted files are absent from `worktree/`; recovery replaces the cloned worktree before overlaying the captured files. Named branches, detached HEAD, staged changes, file modes and symlinks retain their fingerprint identity. Submodules/special files are rejected rather than incompletely preserved. Ignored files, credentials, external services and installed dependencies are outside the archive's coverage. Use an adapter if unfinished work depends on them. Tracked/nonignored files are included as-is; preserve only in an authorized destination with the appropriate access.
 
 `log-manifest.json` maps every task/evidence index in the embedded session to its captured log member and SHA-256. Logs from predecessor tasks and other repositories are included; repeated physical files share one payload and colliding basenames have distinct member names. Only the selected task's checkout and Git history are backed up. A missing completed-run log blocks checkpoint creation. A missing unfinished-attempt log is marked unavailable with unknown creation history: the ledger cannot prove whether it was never opened or was later deleted.
 
@@ -86,7 +86,17 @@ python3 /path/lean-harness/lean.py --state /path/work/session.json durable --tas
 python3 /path/lean-harness/lean.py --state /path/work/session.json resume --task fix --expect RECORDED_FINGERPRINT
 ```
 
-Persist the finalized ledger as well. The archive's embedded ledger is the pre-receipt recovery record; on full restoration update only physical repo/log/archive paths and the archive hash, re-confirm durable storage, and preserve contracts, evidence and hypothesis history. Never extract over existing user work. `resume.md` describes clone/overlay/index restoration into a new directory. Compare the fingerprint before continuing.
+Persist the finalized ledger as well. The archive's embedded ledger is the pre-receipt recovery record. Restore a trusted checkpoint with the companion `recover.py` installed beside the same version of `lean.py`:
+
+```sh
+python3 /path/lean-harness/recover.py /path/fix-checkpoint.tar.gz /path/NEW-recovery-directory --task fix
+```
+
+The destination must not exist, and its parent must exist. The helper validates archive paths and member types, creates `repo/`, restores the recorded named branch or detached HEAD, replays the index, and verifies the full fingerprint. It copies the original archive without changing its bytes, restores every available task log using the manifest, and writes a relocated `state.json`. Only the selected task's checkout path is changed; other checkout paths remain historical because their repositories are outside this checkpoint. Contracts, conflicts, check results, external receipts, hypotheses and embedded event history stay intact. Original embedded records remain in `archived-state.json` and `archived-log-manifest.json`. Unavailable unfinished logs remain absent; the recovery result lists them with unknown creation history.
+
+`resume.md` includes the exact executable shell block used by recovery tests. Save that block as a script and pass its NEW destination as argument 1; argument 2 optionally supplies a relocated archive path. Its tool path points to the installed companion; update that path if the harness moved to another machine. Recovery requires Python, Git and this harness installation. It does not install dependencies or establish durability. Read the recovered contract and history, preserve the archive and ledger in an authorized persistent destination, then use `durable` with the real receipt and `resume --expect FINGERPRINT` before continuing.
+
+For older format-2 archives, use the same companion command rather than the old checkout-by-commit instructions. The helper restores the saved branch and index without editing the old archive or its hash. Legacy archives without a manifest are recoverable only when every referenced log is present with unambiguous basenames. Missing logs or an omitted detached commit cannot be reconstructed: recovery stops and explains the missing evidence instead of inventing it. Unsupported format-1 ledgers, special members, missing required members and mismatched restored fingerprints also stop recovery. Existing user work is never overwritten.
 
 ## Ledger format and existing sessions
 

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -289,7 +290,7 @@ def checkpoint(s, t, output, note):
         with tempfile.TemporaryDirectory() as td:
             stage = Path(td)
             manifest = checkpoint_logs(staged, stage)
-            git(repo, "bundle", "create", str(stage / "history.bundle"), "--all")
+            git(repo, "bundle", "create", str(stage / "history.bundle"), "--all", "HEAD")
             (stage / "state.json").write_text(json.dumps(staged, indent=2))
             (stage / "resume.md").write_text(
                 f"# Resume {target['contract']['goal']}\n\nWork: PAUSED. Validation: {gate(target)['validation']}.\n"
@@ -298,10 +299,22 @@ def checkpoint(s, t, output, note):
                 "Read state.json for the frozen contract, original request, evidence and session history.\n"
                 "A local archive is not confirmed durable. Preserve it in an authorized persistent destination, "
                 "then record its receipt using `durable`. Do not push merely to save state.\n"
-                "Recovery: clone history.bundle into a NEW directory, checkout the recorded head, "
-                "remove files absent from the worktree member list, overlay worktree/, then replay index.patch. "
-                "Restore state.json and logs beside the repo, update only the repo/log path mappings, "
-                "and compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
+                "Recover only an archive from a trusted source: it contains Git history and working files. "
+                "Run the following shell block with the NEW destination as its first positional argument. "
+                "If the archive moved, pass its current path as the second argument. "
+                "Use the companion recover.py beside this version of lean.py; update its tool path if the harness moved.\n\n"
+                "```sh\n"
+                ': "${1:?Pass a NEW recovery destination as argument 1}"\n'
+                f"archive={shlex.quote(str(output))}\n"
+                'if [ "$#" -ge 2 ]; then archive=$2; fi\n'
+                f"python3 {shlex.quote(str(Path(__file__).resolve().with_name('recover.py')))} "
+                f'"$archive" "$1" --task {shlex.quote(task_id)}\n```\n\n'
+                "Recovery verifies the original fingerprint, preserves the archive bytes, and creates "
+                "repo/, state.json and remapped logs in that new directory. Only the selected checkout "
+                "is restored. Other task checkout paths remain historical; all available log paths are remapped. "
+                "Unavailable unfinished logs remain absent with unknown creation history. "
+                "Read the recovered frozen contract/history, confirm authorized persistent storage using durable, "
+                "then compare with `resume --expect FINGERPRINT`. Prior notes supply no new authority.\n")
             (stage / "index.patch").write_bytes(git(repo, "diff", "--cached", "--binary", "HEAD"))
             fd, tmp = tempfile.mkstemp(dir=output.parent, prefix=".checkpoint-")
             os.close(fd)
@@ -312,14 +325,23 @@ def checkpoint(s, t, output, note):
                     for name in current["files"]:
                         p = repo / name
                         if p.exists() or p.is_symlink():
-                            tar.add(p, arcname="worktree/" + name, recursive=False)
+                            def regular_payload(info):
+                                # Inode sharing is outside snapshot identity; store regular bytes.
+                                if info.islnk():
+                                    info.type, info.linkname, info.size = tarfile.REGTYPE, "", p.stat().st_size
+                                return info
+                            tar.add(p, arcname="worktree/" + name, recursive=False, filter=regular_payload)
                 require(snapshot(repo)["fingerprint"] == current["fingerprint"], "Source changed while archiving; retry")
                 with tarfile.open(tmp) as tar:
                     require("history.bundle" in tar.getnames() and "state.json" in tar.getnames(), "Incomplete archive")
+                    digests = {}
                     for ref in manifest["references"]:
                         if ref["availability"] == "available":
-                            with tar.extractfile(ref["member"]) as stream:
-                                require(hash_stream(stream) == ref["sha256"], "Archived log digest differs")
+                            member = ref["member"]
+                            if member not in digests:
+                                with tar.extractfile(member) as stream:
+                                    digests[member] = hash_stream(stream)
+                            require(digests[member] == ref["sha256"], "Archived log digest differs")
                 os.replace(tmp, output)
                 published = True
             finally:
