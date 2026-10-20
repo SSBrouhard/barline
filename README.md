@@ -8,9 +8,18 @@ One lead owns the task and its ledger; specialist agents can help. Optional comp
 
 Experimental software, formerly Lean Harness. Python 3.10+, Git and macOS or Linux are required; use WSL on Windows. No third-party runtime dependencies or services.
 
-## Install from source
+## Install
 
-Until the first public release, install from a clone you can access:
+Install from [PyPI](https://pypi.org/project/barline/) in a virtual environment:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install barline
+barline --help
+```
+
+To install from source instead:
 
 ```sh
 git clone https://github.com/SSBrouhard/barline.git
@@ -21,7 +30,7 @@ python3 -m pip install .
 barline --help
 ```
 
-The repository remains private during release preparation. PyPI packaging is prepared, but `pip install barline` is not yet a supported installation route. You can also run `python3 lean.py` directly from this checkout without installing.
+You can also run `python3 lean.py` directly from a source checkout without installing.
 
 ## Two-minute demonstration
 
@@ -77,7 +86,7 @@ For real work, give your agent [AGENT.md](https://github.com/SSBrouhard/barline/
 - [Optional T3 guide](https://github.com/SSBrouhard/barline/blob/main/examples/t3/README.md) and [npm contract example](https://github.com/SSBrouhard/barline/blob/main/examples/contracts/npm.json)
 - [Building and publishing](https://github.com/SSBrouhard/barline/blob/main/docs/releasing.md)
 
-Run the regression suite with `python3 -B -m unittest discover -s tests -v`. CI runs it on macOS/Linux with Python 3.10/3.14 and verifies installed distributions.
+From a source checkout, run the regression suite with `python3 -B -m unittest discover -s tests -v`. CI runs it on macOS/Linux with Python 3.10/3.14 and verifies installed distributions.
 
 ## Limits
 

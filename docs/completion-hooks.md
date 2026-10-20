@@ -126,7 +126,7 @@ Process fixtures in `tests/fixtures/hooks/` are source-derived examples, not nat
 
 ### Native validation status, 2026-10-20
 
-Native loading and Stop behavior were observed in the following exact versions and launch modes using disposable repositories and client profiles/settings. The local suite now has 76 tests: 31 shared/native-protocol tests and 45 core/recovery tests. The original native smoke run accompanied 71 tests; follow-up regressions cover failed prompt recording, worker deadlines and lightweight turn validation. Native prompt-recovery observations are recorded separately. The existing macOS/Linux and Python 3.10/3.14 CI matrix remains unchanged; hosted CI was not invoked for this local work.
+Native loading and Stop behavior were observed in the following exact versions and launch modes using disposable repositories and client profiles/settings. The release preparation suite has 77 tests. The original native smoke run accompanied 71 tests; follow-up regressions cover failed prompt recording, worker deadlines, lightweight turn validation and timeout cleanup. Native prompt-recovery observations are recorded separately. Release preparation passed hosted CI on macOS/Linux with Python 3.10/3.14, including installation smoke tests for both the wheel and sdist.
 
 | Client | Observed launch | Observed outcomes and limits |
 | --- | --- | --- |
