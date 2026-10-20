@@ -119,7 +119,9 @@ def contract(c):
 
 def gate(t):
     now = snapshot(t["repo"])
-    latest = {e["check"]: e for e in t["evidence"] if e["fingerprint"] == now["fingerprint"]}
+    # A newer attempt supersedes the old one even if its source no longer matches.
+    attempts = {e["check"]: e for e in t["evidence"]}
+    latest = {name: e for name, e in attempts.items() if e["fingerprint"] == now["fingerprint"]}
     missing = [name for name in t["contract"]["checks"] if name not in latest]
     failed = [name for name, e in latest.items() if e["status"] == "FAIL"]
     blocked = [name for name, e in latest.items() if e["status"] == "BLOCKED"]

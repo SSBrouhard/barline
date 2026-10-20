@@ -26,6 +26,8 @@ The everyday flow is user request, frozen contract, implementation, relevant che
 
 Local checks execute, log their command/exit/result/environment, and bind evidence to HEAD, branch, index, tracked files and nonignored untracked files. An edit or branch switch makes old checks stale. Source-mutating checks become INCONCLUSIVE. Ignored dependencies/build output and external state are not fingerprinted; report environmental limits and add repo-specific behavioral checks when needed.
 
+Only the latest attempt for each check can qualify, and it must PASS on the current fingerprint. Returning to an earlier tree cannot revive its older pass after a newer failed, blocked or inconclusive attempt. A latest attempt on a different tree is reported in `missing`; rerun that check unchanged on the current tree. Other checks keep their own attempt history.
+
 `assess` is the lead's recorded acceptance judgment, separate from command evidence. A PASS says every configured local check passed on this tree and the lead marked its bar met. It does not certify arbitrary semantics, independent review or a deployed system. Work state (ACTIVE/PAUSED), scope and validation (PASS/FAIL/BLOCKED/INCONCLUSIVE) stay separate.
 
 ### Follow-ups and frozen contracts
@@ -57,7 +59,7 @@ Only the lead mutates the ledger and owns integration, evidence and completion. 
 
 T3's `delegate_task` supplies child task records, provider/model selection, worktree isolation and async completion notifications. Worktree children start from the parent's local commit; uncommitted edits are absent. The lead verifies the base commit, reads `task_status` and the durable child timeline, inspects actual artifacts and runs named checks. T3 limits a child's runtime mode to the parent's ceiling. A narrower mode can require human approval; it does not make the child read-only. No-edit, no-further-delegation and publication restrictions remain instructions even when children have orchestration tools. See [PRINCIPLES.md](PRINCIPLES.md) for optional, pinned, on-demand decision guidance.
 
-The executable exclusively locks the ledger and writes it atomically. It records a BLOCKED check result before launch and replaces that provisional result only after observing completion. A lead crash therefore cannot expose an older PASS for the same check/tree. The record includes the process group when known; after a crash, verify and clean up owned work before rerunning. Never blindly signal a recorded PID, which may have been reused. Check timeouts and interruption terminate the owned process group. Check output goes to local log files; log size is not capped.
+The executable exclusively locks the ledger and writes it atomically. It records a BLOCKED check result before launch and replaces that provisional result only after observing completion. A lead crash therefore cannot expose an older PASS for the same check, even after source restoration. The record includes the process group when known; after a crash, verify and clean up owned work before rerunning. Never blindly signal a recorded PID, which may have been reused. Check timeouts and interruption terminate the owned process group. Check output goes to local log files; log size is not capped.
 
 `hypothesis --task fix --description 'specific causal explanation' --result failed` records a repair attempt. Two failed hypotheses block new work. `park --task fix --next 'unrelated discovery'` records scope exclusions. These declarations are procedural accounting, not automatic detection of what the agent thinks or does.
 

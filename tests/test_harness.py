@@ -246,6 +246,59 @@ class HarnessTests(unittest.TestCase):
         self.assess()
         self.assertNotEqual(self.gate()["validation"], "PASS")
 
+    def assert_latest_attempt_prevents_revival(self, script, expected_status, timeout=3):
+        marker = self.root / "later-attempt"
+        self.setup_task("from pathlib import Path; import time; "
+                        f"later = Path({str(marker)!r}).exists(); " + script, timeout=timeout)
+        self.run_check()
+        self.assess()
+        self.assertEqual(self.gate(code=0)["validation"], "PASS")
+        (self.repo / "source.txt").write_text("changed\n")
+        marker.touch()
+        self.assertEqual(self.run_check(code=1)["status"], expected_status)
+        if expected_status == "INCONCLUSIVE":
+            self.assertEqual((self.repo / "source.txt").read_text(), "original\n")
+        (self.repo / "source.txt").write_text("original\n")
+        recorded = json.loads(self.state.read_text())
+        result = self.gate()
+        self.assertNotEqual(result["validation"], "PASS")
+        self.assertEqual(result["missing"], ["test"])
+        # Existing format-2 history is interpreted directly, without migration or rewriting evidence.
+        observed = json.loads(self.state.read_text())
+        self.assertEqual(observed["version"], 2)
+        self.assertEqual(observed["tasks"]["one"]["evidence"], recorded["tasks"]["one"]["evidence"])
+        marker.unlink()
+        self.run_check()
+        self.assertEqual(self.gate(code=0)["validation"], "PASS")
+
+    def test_inconclusive_attempt_cannot_revive_older_pass_after_restoring_source(self):
+        self.assert_latest_attempt_prevents_revival(
+            "Path('source.txt').write_text('original\\n') if later else None", "INCONCLUSIVE")
+
+    def test_failed_attempt_cannot_revive_older_pass_after_restoring_source(self):
+        self.assert_latest_attempt_prevents_revival("raise SystemExit(1 if later else 0)", "FAIL")
+
+    def test_blocked_attempt_cannot_revive_older_pass_after_restoring_source(self):
+        self.assert_latest_attempt_prevents_revival("time.sleep(10) if later else None", "BLOCKED", timeout=0.5)
+
+    def test_refreshing_one_check_cannot_revive_another_checks_older_pass(self):
+        c = self.setup_task()
+        c["checks"]["other"] = dict(c["checks"]["test"])
+        self.contract.write_text(json.dumps(c))
+        self.call("start", "--task", "two-checks", "--repo", self.repo, "--contract", self.contract)
+        for name in ("test", "other"):
+            self.call("run", "--task", "two-checks", "--check", name)
+        self.call("assess", "--task", "two-checks", "--outcome", "met", "--evidence", "Both checks observed")
+        self.assertEqual(self.call("gate", "--task", "two-checks")["validation"], "PASS")
+        (self.repo / "source.txt").write_text("changed\n")
+        for name in ("test", "other"):
+            self.call("run", "--task", "two-checks", "--check", name)
+        (self.repo / "source.txt").write_text("original\n")
+        self.call("run", "--task", "two-checks", "--check", "test")
+        self.assertEqual(self.call("gate", "--task", "two-checks", code=1)["missing"], ["other"])
+        self.call("run", "--task", "two-checks", "--check", "other")
+        self.assertEqual(self.call("gate", "--task", "two-checks")["validation"], "PASS")
+
     def test_inherited_failure_is_not_excused(self):
         self.setup_task("raise SystemExit(1)")
         self.assertEqual(self.run_check(code=1)["status"], "FAIL")
@@ -303,13 +356,21 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(self.gate()["validation"], "BLOCKED")
 
     def test_killed_lead_cannot_reveal_previous_pass(self):
+        self.assert_killed_lead_cannot_reveal_previous_pass(restore_source=False)
+
+    def test_killed_lead_on_changed_tree_cannot_revive_older_pass(self):
+        self.assert_killed_lead_cannot_reveal_previous_pass(restore_source=True)
+
+    def assert_killed_lead_cannot_reveal_previous_pass(self, restore_source):
         marker = self.root / "slow"
         self.setup_task(f"from pathlib import Path; import time; "
                         f"time.sleep(10) if Path({str(marker)!r}).exists() else None", timeout=15)
         self.run_check()
         self.assess()
         self.assertEqual(self.gate(code=0)["validation"], "PASS")
-        marker.touch()  # External fixture control leaves the repository fingerprint unchanged.
+        marker.touch()  # External control chooses a slow check without mutating its source.
+        if restore_source:
+            (self.repo / "source.txt").write_text("changed\n")
         p = subprocess.Popen([sys.executable, str(CLI), "--state", str(self.state), "run",
                               "--task", "one", "--check", "test"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         group = None
@@ -323,9 +384,16 @@ class HarnessTests(unittest.TestCase):
             self.assertIsNotNone(group)
             p.kill()
             p.communicate(timeout=3)
+            self.assertEqual(json.loads(self.state.read_text())["tasks"]["one"]["evidence"][-1]["status"], "BLOCKED")
+            if restore_source:
+                (self.repo / "source.txt").write_text("original\n")
             result = self.gate()
-            self.assertEqual(result["validation"], "BLOCKED")
-            self.assertIn("test", result["blocked"])
+            if restore_source:
+                self.assertEqual(result["validation"], "INCONCLUSIVE")
+                self.assertIn("test", result["missing"])
+            else:
+                self.assertEqual(result["validation"], "BLOCKED")
+                self.assertIn("test", result["blocked"])
         finally:
             if p.poll() is None:
                 p.kill()
